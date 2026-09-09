@@ -684,6 +684,11 @@ public class ReverseProxyManagerTests
                 {
                     RootDirectory = root,
                     Data = Path.Combine(root, "data"),
+                    // WebSpaceDataPath() resolves via FuseQuotaLimiter when
+                    // DiskLimiterMode defaults to fuse_quota, which would put the
+                    // cert files below outside of config.System.Data. Force "none"
+                    // so CustomSslFiles() actually finds them under Data.
+                    DiskLimiterMode = "none",
                     Proxy = new ProxyConfig { Enabled = true, Provider = "nginx" },
                 },
             };
@@ -720,9 +725,14 @@ public class ReverseProxyManagerTests
             };
 
             var nginx = mgr.BuildConfig([space]);
-            Assert.Contains("server_name www.example.com;", nginx);
-            Assert.Contains("listen 443 ssl;", nginx);
-            Assert.Contains("return 301 https://example.com$request_uri;", nginx);
+
+            // CodeRabbit: bind these assertions to the SAME server block instead
+            // of just checking the strings exist anywhere in the file, so this
+            // test actually fails if listen 443 ssl and server_name land in
+            // different (wrong) server blocks.
+            var httpsBlock = ExtractServerBlock(nginx, "listen 443 ssl;", "server_name www.example.com;");
+            Assert.NotNull(httpsBlock);
+            Assert.Contains("return 301 https://example.com$request_uri;", httpsBlock);
             Assert.Equal("example.com", ReverseProxyManager.ResolveApexDomain(space));
         }
         finally
@@ -744,6 +754,7 @@ public class ReverseProxyManagerTests
                 {
                     RootDirectory = root,
                     Data = Path.Combine(root, "data"),
+                    DiskLimiterMode = "none",
                     Proxy = new ProxyConfig { Enabled = true, Provider = "nginx" },
                 },
             };
@@ -779,6 +790,14 @@ public class ReverseProxyManagerTests
             Assert.DoesNotContain("listen 443 ssl;", nginx);
             Assert.Contains("location ^~ /.well-known/acme-challenge/", nginx);
             Assert.Contains($"proxy_pass http://127.0.0.1:20123;", nginx);
+
+            // CodeRabbit: this test previously didn't check the redirect host at
+            // all, so it would still pass even if www.example.com's :80 redirect
+            // block silently disappeared. Verify it's still there with the right
+            // target.
+            var redirectBlock = ExtractServerBlock(nginx, "listen 80;", "server_name www.example.com;");
+            Assert.NotNull(redirectBlock);
+            Assert.Contains("return 301 https://example.com$request_uri;", redirectBlock);
         }
         finally
         {
@@ -888,5 +907,24 @@ public class ReverseProxyManagerTests
         {
             try { Directory.Delete(root, true); } catch { /* ignore */ }
         }
+    }
+
+    /// <summary>
+    /// Splits a generated nginx config into its individual "server { ... }"
+    /// blocks and returns the content of the first block that contains ALL
+    /// of the given marker strings, or null if none matches. Lets tests
+    /// assert that two directives (e.g. "listen 443 ssl;" and a specific
+    /// server_name) landed in the SAME block instead of just appearing
+    /// somewhere in the file.
+    /// </summary>
+    private static string? ExtractServerBlock(string nginxConfig, params string[] mustContainAll)
+    {
+        foreach (var block in nginxConfig.Split("server {", StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (Array.TrueForAll(mustContainAll, marker => block.Contains(marker)))
+                return block;
+        }
+
+        return null;
     }
 }
