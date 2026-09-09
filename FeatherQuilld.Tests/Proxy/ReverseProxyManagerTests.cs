@@ -689,6 +689,66 @@ public class ReverseProxyManagerTests
             };
 
             var mgr = new ReverseProxyManager(config);
+            var spaceUuid = Guid.NewGuid();
+
+            // listen 443 ssl is only ever emitted once a real cert exists on disk
+            // (see BuildNginx) - use SslMode=custom so the cert lives under the
+            // per-space test data dir instead of the hardcoded system cert path.
+            var certDir = Path.Combine(config.System.Data, spaceUuid.ToString(), "ssl", "custom");
+            Directory.CreateDirectory(certDir);
+            File.WriteAllText(Path.Combine(certDir, "cert.pem"), "test-cert");
+            File.WriteAllText(Path.Combine(certDir, "key.pem"), "test-key");
+
+            var space = new WebSpace
+            {
+                Uuid = spaceUuid,
+                Domains = ["example.com", "www.example.com"],
+                DomainRoutes =
+                [
+                    new WebSpaceDomainRoute { Domain = "example.com", Type = "primary" },
+                    new WebSpaceDomainRoute
+                    {
+                        Domain = "www.example.com",
+                        Type = "redirect",
+                        RedirectTarget = "https://example.com",
+                    },
+                ],
+                Ssl = true,
+                SslMode = "custom",
+                BackendPort = 20123,
+                CreatedAt = DateTimeOffset.UtcNow,
+            };
+
+            var nginx = mgr.BuildConfig([space]);
+            Assert.Contains("server_name www.example.com;", nginx);
+            Assert.Contains("listen 443 ssl;", nginx);
+            Assert.Contains("return 301 https://example.com$request_uri;", nginx);
+            Assert.Equal("example.com", ReverseProxyManager.ResolveApexDomain(space));
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { /* ignore */ }
+        }
+    }
+
+    [Fact]
+    public void BuildConfig_Nginx_RedirectHost_SkipsHttpsBlockWhenCertMissing()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "fq-proxy-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var config = new AppConfig
+            {
+                System = new SystemConfig
+                {
+                    RootDirectory = root,
+                    Data = Path.Combine(root, "data"),
+                    Proxy = new ProxyConfig { Enabled = true, Provider = "nginx" },
+                },
+            };
+
+            var mgr = new ReverseProxyManager(config);
             var space = new WebSpace
             {
                 Uuid = Guid.NewGuid(),
@@ -704,15 +764,21 @@ public class ReverseProxyManagerTests
                     },
                 ],
                 Ssl = true,
+                SslMode = "custom", // no cert files created -> stays pending
                 BackendPort = 20123,
                 CreatedAt = DateTimeOffset.UtcNow,
             };
 
             var nginx = mgr.BuildConfig([space]);
-            Assert.Contains("server_name www.example.com;", nginx);
-            Assert.Contains("listen 443 ssl;", nginx);
-            Assert.Contains("return 301 https://example.com$request_uri;", nginx);
-            Assert.Equal("example.com", ReverseProxyManager.ResolveApexDomain(space));
+
+            // No cert yet: never emit a broken "listen 443 ssl" block (it would
+            // make nginx -t fail for the whole file and silently kill every other
+            // domain's ACME challenge along with it), and the main app domain
+            // must keep serving over plain :80 instead of redirecting to a https
+            // that doesn't work yet.
+            Assert.DoesNotContain("listen 443 ssl;", nginx);
+            Assert.Contains("location ^~ /.well-known/acme-challenge/", nginx);
+            Assert.Contains($"proxy_pass http://127.0.0.1:20123;", nginx);
         }
         finally
         {

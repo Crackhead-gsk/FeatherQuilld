@@ -310,20 +310,34 @@ public sealed class ReverseProxyManager
                     sb.AppendLine();
 
                     // HTTPS on redirect hosts so www↔apex works when clients hit https://www.…
+                    // Same rule as the main SSL block below: never emit "listen 443 ssl"
+                    // without a real ssl_certificate, or nginx -t fails for the whole
+                    // generated file and every domain's ACME challenge silently stops
+                    // working until someone notices.
                     if (space.Ssl)
                     {
                         var redirectSsl = ResolveSslFiles(space, domain);
-                        sb.AppendLine("server {");
-                        sb.AppendLine("    listen 443 ssl;");
-                        sb.AppendLine($"    server_name {domain};");
-                        if (redirectSsl is not null && File.Exists(redirectSsl.Value.cert) && File.Exists(redirectSsl.Value.key))
+                        var redirectCertReady = redirectSsl is not null
+                            && File.Exists(redirectSsl.Value.cert)
+                            && File.Exists(redirectSsl.Value.key);
+
+                        if (redirectCertReady)
                         {
-                            sb.AppendLine($"    ssl_certificate     {redirectSsl.Value.cert};");
+                            sb.AppendLine("server {");
+                            sb.AppendLine("    listen 443 ssl;");
+                            sb.AppendLine($"    server_name {domain};");
+                            sb.AppendLine($"    ssl_certificate     {redirectSsl!.Value.cert};");
                             sb.AppendLine($"    ssl_certificate_key {redirectSsl.Value.key};");
+                            sb.AppendLine($"    return 301 {target}$request_uri;");
+                            sb.AppendLine("}");
+                            sb.AppendLine();
                         }
-                        sb.AppendLine($"    return 301 {target}$request_uri;");
-                        sb.AppendLine("}");
-                        sb.AppendLine();
+                        else
+                        {
+                            _logger?.Warning(LoggerTypes.Proxy,
+                                $"nginx SSL redirect enabled for {domain} but certs missing; " +
+                                "skipping the :443 redirect block until the certificate is issued");
+                        }
                     }
 
                     continue;
@@ -332,7 +346,37 @@ public sealed class ReverseProxyManager
                 var accessLog = ProxyAccessLogs.AccessLogPath(_config.System.RootDirectory, space.Uuid, domain);
                 var errorLog = ProxyAccessLogs.ErrorLogPath(_config.System.RootDirectory, space.Uuid, domain);
 
-                // Always expose HTTP for ACME challenges (and non-SSL sites).
+                // A "listen 443 ssl" server block with no ssl_certificate directive is a
+                // hard nginx config error ("no ssl_certificate is defined for the
+                // listen ... ssl directive"). `nginx -t` then fails for the ENTIRE
+                // generated file, not just this block, so a reload silently keeps
+                // nginx on its last-good config - which for a brand new domain means
+                // this domain's :80 ACME-challenge location never actually loads
+                // either. The ACME HTTP-01 challenge then 404s forever, the
+                // certificate is never issued, and the domain can end up hitting
+                // Let's Encrypt's failed-authorization rate limit while looking
+                // "stuck" from the outside.
+                //
+                // Fix: only ever emit "listen 443 ssl" once the certificate files
+                // actually exist on disk. Until then, keep serving the app directly
+                // on :80 (alongside the ACME challenge location) instead of
+                // redirecting to a https:// that isn't ready yet, so the site stays
+                // reachable and the ACME challenge keeps working while a cert is
+                // pending.
+                var sslFiles = ResolveSslFiles(space, domain);
+                var crt = sslFiles?.cert ?? NginxAcmeService.CertPath(domain);
+                var key = sslFiles?.key ?? NginxAcmeService.KeyPath(domain);
+                var certReady = space.Ssl && File.Exists(crt) && File.Exists(key);
+
+                if (space.Ssl && !certReady)
+                {
+                    _logger?.Warning(LoggerTypes.Proxy,
+                        $"nginx SSL enabled for {domain} but certs missing at {crt} / {key}; " +
+                        "serving over plain HTTP until the certificate is issued");
+                }
+
+                // Always expose HTTP for ACME challenges (and non-SSL sites, and SSL
+                // sites still waiting on their first certificate).
                 sb.AppendLine("server {");
                 sb.AppendLine("    listen 80;");
                 sb.AppendLine($"    server_name {domain};");
@@ -345,7 +389,7 @@ public sealed class ReverseProxyManager
                 sb.AppendLine("        default_type text/plain;");
                 sb.AppendLine("    }");
 
-                if (!space.Ssl)
+                if (!space.Ssl || !certReady)
                     AppendNginxAppLocation(sb, space, route);
                 else
                     sb.AppendLine("    location / { return 301 https://$host$request_uri; }");
@@ -353,31 +397,16 @@ public sealed class ReverseProxyManager
                 sb.AppendLine("}");
                 sb.AppendLine();
 
-                if (!space.Ssl)
+                if (!space.Ssl || !certReady)
                     continue;
 
-                var sslFiles = ResolveSslFiles(space, domain);
-                var crt = sslFiles?.cert ?? NginxAcmeService.CertPath(domain);
-                var key = sslFiles?.key ?? NginxAcmeService.KeyPath(domain);
                 sb.AppendLine("server {");
                 sb.AppendLine("    listen 443 ssl;");
                 sb.AppendLine($"    server_name {domain};");
                 sb.AppendLine($"    access_log {accessLog};");
                 sb.AppendLine($"    error_log {errorLog};");
-
-                if (File.Exists(crt) && File.Exists(key))
-                {
-                    sb.AppendLine($"    ssl_certificate     {crt};");
-                    sb.AppendLine($"    ssl_certificate_key {key};");
-                }
-                else
-                {
-                    _logger?.Warning(LoggerTypes.Proxy,
-                        $"nginx SSL enabled for {domain} but certs missing at {crt} / {key}");
-                    sb.AppendLine($"    # WARN: SSL enabled but certs missing for {domain}");
-                    sb.AppendLine($"    # ssl_certificate     {crt};");
-                    sb.AppendLine($"    # ssl_certificate_key {key};");
-                }
+                sb.AppendLine($"    ssl_certificate     {crt};");
+                sb.AppendLine($"    ssl_certificate_key {key};");
 
                 if (space.WafEnabled)
                     AppendNginxWafDirectives(sb, space);
