@@ -684,6 +684,77 @@ public class ReverseProxyManagerTests
                 {
                     RootDirectory = root,
                     Data = Path.Combine(root, "data"),
+                    // WebSpaceDataPath() resolves via FuseQuotaLimiter when
+                    // DiskLimiterMode defaults to fuse_quota, which would put the
+                    // cert files below outside of config.System.Data. Force "none"
+                    // so CustomSslFiles() actually finds them under Data.
+                    DiskLimiterMode = "none",
+                    Proxy = new ProxyConfig { Enabled = true, Provider = "nginx" },
+                },
+            };
+
+            var mgr = new ReverseProxyManager(config);
+            var spaceUuid = Guid.NewGuid();
+
+            // listen 443 ssl is only ever emitted once a real cert exists on disk
+            // (see BuildNginx) - use SslMode=custom so the cert lives under the
+            // per-space test data dir instead of the hardcoded system cert path.
+            var certDir = Path.Combine(config.System.Data, spaceUuid.ToString(), "ssl", "custom");
+            Directory.CreateDirectory(certDir);
+            File.WriteAllText(Path.Combine(certDir, "cert.pem"), "test-cert");
+            File.WriteAllText(Path.Combine(certDir, "key.pem"), "test-key");
+
+            var space = new WebSpace
+            {
+                Uuid = spaceUuid,
+                Domains = ["example.com", "www.example.com"],
+                DomainRoutes =
+                [
+                    new WebSpaceDomainRoute { Domain = "example.com", Type = "primary" },
+                    new WebSpaceDomainRoute
+                    {
+                        Domain = "www.example.com",
+                        Type = "redirect",
+                        RedirectTarget = "https://example.com",
+                    },
+                ],
+                Ssl = true,
+                SslMode = "custom",
+                BackendPort = 20123,
+                CreatedAt = DateTimeOffset.UtcNow,
+            };
+
+            var nginx = mgr.BuildConfig([space]);
+
+            // CodeRabbit: bind these assertions to the SAME server block instead
+            // of just checking the strings exist anywhere in the file, so this
+            // test actually fails if listen 443 ssl and server_name land in
+            // different (wrong) server blocks.
+            var httpsBlock = ExtractServerBlock(nginx, "listen 443 ssl;", "server_name www.example.com;");
+            Assert.NotNull(httpsBlock);
+            Assert.Contains("return 301 https://example.com$request_uri;", httpsBlock);
+            Assert.Equal("example.com", ReverseProxyManager.ResolveApexDomain(space));
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { /* ignore */ }
+        }
+    }
+
+    [Fact]
+    public void BuildConfig_Nginx_RedirectHost_SkipsHttpsBlockWhenCertMissing()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "fq-proxy-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var config = new AppConfig
+            {
+                System = new SystemConfig
+                {
+                    RootDirectory = root,
+                    Data = Path.Combine(root, "data"),
+                    DiskLimiterMode = "none",
                     Proxy = new ProxyConfig { Enabled = true, Provider = "nginx" },
                 },
             };
@@ -704,15 +775,29 @@ public class ReverseProxyManagerTests
                     },
                 ],
                 Ssl = true,
+                SslMode = "custom", // no cert files created -> stays pending
                 BackendPort = 20123,
                 CreatedAt = DateTimeOffset.UtcNow,
             };
 
             var nginx = mgr.BuildConfig([space]);
-            Assert.Contains("server_name www.example.com;", nginx);
-            Assert.Contains("listen 443 ssl;", nginx);
-            Assert.Contains("return 301 https://example.com$request_uri;", nginx);
-            Assert.Equal("example.com", ReverseProxyManager.ResolveApexDomain(space));
+
+            // No cert yet: never emit a broken "listen 443 ssl" block (it would
+            // make nginx -t fail for the whole file and silently kill every other
+            // domain's ACME challenge along with it), and the main app domain
+            // must keep serving over plain :80 instead of redirecting to a https
+            // that doesn't work yet.
+            Assert.DoesNotContain("listen 443 ssl;", nginx);
+            Assert.Contains("location ^~ /.well-known/acme-challenge/", nginx);
+            Assert.Contains($"proxy_pass http://127.0.0.1:20123;", nginx);
+
+            // CodeRabbit: this test previously didn't check the redirect host at
+            // all, so it would still pass even if www.example.com's :80 redirect
+            // block silently disappeared. Verify it's still there with the right
+            // target.
+            var redirectBlock = ExtractServerBlock(nginx, "listen 80;", "server_name www.example.com;");
+            Assert.NotNull(redirectBlock);
+            Assert.Contains("return 301 https://example.com$request_uri;", redirectBlock);
         }
         finally
         {
@@ -753,9 +838,24 @@ public class ReverseProxyManagerTests
                 CreatedAt = DateTimeOffset.UtcNow,
             };
 
+            // The apex-cert-path resolution this test exists to cover:
+            // dns01 mode must resolve every alias to the PRIMARY domain's
+            // wildcard cert, never blog.example.com's own (nonexistent) cert.
+            Assert.Equal("example.com", ReverseProxyManager.ResolveApexDomain(space));
+
+            // NginxAcmeService.CertPath() points at the hardcoded system path
+            // /etc/featherquilld/certs, which tests must not write to (no
+            // guaranteed permissions on CI, and it would be shared mutable
+            // state across test runs) - so this exercises the realistic
+            // certReady=false path instead of asserting the crt/key path
+            // string leaks into the config.
             var nginx = mgr.BuildConfig([space]);
-            Assert.Contains(NginxAcmeService.CertPath("example.com"), nginx);
+            Assert.DoesNotContain("listen 443 ssl;", nginx);
+            Assert.DoesNotContain(NginxAcmeService.CertPath("example.com"), nginx);
             Assert.DoesNotContain(NginxAcmeService.CertPath("blog.example.com"), nginx);
+            Assert.Contains("server_name example.com;", nginx);
+            Assert.Contains("server_name blog.example.com;", nginx);
+            Assert.Contains("location ^~ /.well-known/acme-challenge/", nginx);
         }
         finally
         {
@@ -822,5 +922,24 @@ public class ReverseProxyManagerTests
         {
             try { Directory.Delete(root, true); } catch { /* ignore */ }
         }
+    }
+
+    /// <summary>
+    /// Splits a generated nginx config into its individual "server { ... }"
+    /// blocks and returns the content of the first block that contains ALL
+    /// of the given marker strings, or null if none matches. Lets tests
+    /// assert that two directives (e.g. "listen 443 ssl;" and a specific
+    /// server_name) landed in the SAME block instead of just appearing
+    /// somewhere in the file.
+    /// </summary>
+    private static string? ExtractServerBlock(string nginxConfig, params string[] mustContainAll)
+    {
+        foreach (var block in nginxConfig.Split("server {", StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (Array.TrueForAll(mustContainAll, marker => block.Contains(marker)))
+                return block;
+        }
+
+        return null;
     }
 }
