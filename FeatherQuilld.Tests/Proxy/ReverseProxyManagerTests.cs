@@ -838,9 +838,24 @@ public class ReverseProxyManagerTests
                 CreatedAt = DateTimeOffset.UtcNow,
             };
 
+            // The apex-cert-path resolution this test exists to cover:
+            // dns01 mode must resolve every alias to the PRIMARY domain's
+            // wildcard cert, never blog.example.com's own (nonexistent) cert.
+            Assert.Equal("example.com", ReverseProxyManager.ResolveApexDomain(space));
+
+            // NginxAcmeService.CertPath() points at the hardcoded system path
+            // /etc/featherquilld/certs, which tests must not write to (no
+            // guaranteed permissions on CI, and it would be shared mutable
+            // state across test runs) - so this exercises the realistic
+            // certReady=false path instead of asserting the crt/key path
+            // string leaks into the config.
             var nginx = mgr.BuildConfig([space]);
-            Assert.Contains(NginxAcmeService.CertPath("example.com"), nginx);
+            Assert.DoesNotContain("listen 443 ssl;", nginx);
+            Assert.DoesNotContain(NginxAcmeService.CertPath("example.com"), nginx);
             Assert.DoesNotContain(NginxAcmeService.CertPath("blog.example.com"), nginx);
+            Assert.Contains("server_name example.com;", nginx);
+            Assert.Contains("server_name blog.example.com;", nginx);
+            Assert.Contains("location ^~ /.well-known/acme-challenge/", nginx);
         }
         finally
         {
