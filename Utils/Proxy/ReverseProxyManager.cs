@@ -135,6 +135,9 @@ public sealed class ReverseProxyManager
             _logger?.Info(LoggerTypes.Proxy, $"Wrote proxy config → {path}");
             _logger?.Debug(LoggerTypes.Proxy, body.Length > 500 ? body[..500] + "…" : body);
 
+            if (provider == "nginx")
+                EnsureSystemNginxIncludes(path);
+
             foreach (var space in list)
             {
                 ProxyAccessLogs.EnsureDir(_config.System.RootDirectory, space.Uuid);
@@ -168,6 +171,71 @@ public sealed class ReverseProxyManager
             _ => "Caddyfile",
         };
         return Path.Combine(_config.System.RootDirectory, "proxy", fileName);
+    }
+
+    internal void EnsureSystemNginxIncludes(string generatedConfigPath) =>
+        EnsureSystemNginxIncludes(generatedConfigPath, "/etc/nginx/conf.d", "/etc/nginx/conf.d/featherquilld.conf");
+
+    /// <summary>
+    /// FeatherQuilld only WRITES the generated nginx server blocks to
+    /// <c>{RootDirectory}/proxy/nginx.conf</c> - it never touches the system nginx's
+    /// own config tree. Stock nginx (`/etc/nginx/nginx.conf`) only loads
+    /// <c>/etc/nginx/conf.d/*.conf</c> and <c>/etc/nginx/sites-enabled/*</c>, so
+    /// without an explicit include, every WebSpace domain silently falls through
+    /// to nginx's `default_server` (usually the stock "Welcome to nginx!" page)
+    /// forever, even though `nginx -t` on the generated file alone looks fine and
+    /// the FeatherQuilld logs report a successful write + reload. Best-effort: only
+    /// acts on a stock `/etc/nginx/conf.d` layout, never overwrites an existing
+    /// include the operator may have customized, and any failure here must not
+    /// block the config write/reload that already happened.
+    /// </summary>
+    internal void EnsureSystemNginxIncludes(string generatedConfigPath, string confDDir, string includePath)
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        // Operator pointed ConfigPath somewhere custom (e.g. straight at
+        // /etc/nginx/conf.d/featherquilld.conf) - they're responsible for wiring
+        // it into nginx themselves.
+        if (!string.IsNullOrWhiteSpace(_config.System.Proxy.ConfigPath))
+            return;
+
+        try
+        {
+            if (!Directory.Exists(confDDir))
+            {
+                _logger?.Debug(LoggerTypes.Proxy,
+                    $"{confDDir} not found; skipping system nginx include (non-stock layout, wire {generatedConfigPath} in manually)");
+                return;
+            }
+
+            var desired = $"# Managed by FeatherQuilld - do not edit by hand{Environment.NewLine}include {generatedConfigPath};{Environment.NewLine}";
+
+            if (File.Exists(includePath))
+            {
+                var current = File.ReadAllText(includePath);
+                if (string.Equals(current, desired, StringComparison.Ordinal))
+                    return;
+
+                // Only overwrite a file we recognize as our own managed marker;
+                // never clobber something the operator hand-wrote at this path.
+                if (!current.Contains("Managed by FeatherQuilld", StringComparison.Ordinal))
+                {
+                    _logger?.Warning(LoggerTypes.Proxy,
+                        $"{includePath} already exists and isn't FeatherQuilld-managed; leaving it alone - " +
+                        $"ensure it includes {generatedConfigPath} for domains to actually route");
+                    return;
+                }
+            }
+
+            File.WriteAllText(includePath, desired);
+            _logger?.Info(LoggerTypes.Proxy, $"Wrote {includePath} → include {generatedConfigPath}");
+        }
+        catch (Exception ex)
+        {
+            _logger?.Warning(LoggerTypes.Proxy,
+                $"Could not ensure {includePath} includes {generatedConfigPath}: {ex.Message}");
+        }
     }
 
     private string ContentRoot(WebSpace space, WebSpaceDomainRoute? route = null)
