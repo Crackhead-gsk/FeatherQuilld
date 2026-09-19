@@ -1010,7 +1010,7 @@ public sealed class WebSpaceStore : IWebSpaceFsAccess
     {
         var space = Get(uuid) ?? throw new InvalidOperationException($"WebSpace {uuid} not found.");
         if (!WebSpaceRuntime.NeedsContainer(space.Runtime))
-            return "(static WebSpace no runtime container logs)\n";
+            return BuildStaticServerLogs(space, lines, query, regex, searchScanLines);
 
         var text = _runtime.GetLogsAsync(uuid, Math.Clamp(searchScanLines, lines, 10_000)).GetAwaiter().GetResult();
         if (string.IsNullOrWhiteSpace(query))
@@ -1021,6 +1021,54 @@ public sealed class WebSpaceStore : IWebSpaceFsAccess
             query.Trim(),
             regex);
         return string.Join('\n', filtered.Count <= lines ? filtered : filtered.Skip(filtered.Count - lines));
+    }
+
+    /// <summary>
+    /// Static WebSpaces have no runtime container, so what the web server logged for them is
+    /// the closest thing to a console. Returning that keeps the log view useful for
+    /// HTML-only WebSpaces instead of a placeholder line.
+    /// </summary>
+    private string BuildStaticServerLogs(
+        WebSpace space,
+        int lines,
+        string? query,
+        bool regex,
+        int searchScanLines)
+    {
+        lines = Math.Clamp(lines, 1, 5000);
+        searchScanLines = Math.Clamp(searchScanLines, lines, ProxyAccessLogs.DefaultSearchScanLines);
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"# static WebSpace ({space.Runtime}) has no runtime container - showing web server logs");
+        sb.AppendLine($"# files served from {EffectiveFsPath(space.Uuid)}");
+
+        var hosts = space.Domains.Where(d => !string.IsNullOrWhiteSpace(d)).ToList();
+        if (hosts.Count == 0)
+        {
+            sb.AppendLine("(no domain configured for this WebSpace)");
+            return sb.ToString();
+        }
+
+        foreach (var host in hosts)
+        {
+            var accessPath = ProxyAccessLogs.AccessLogPath(_config.System.RootDirectory, space.Uuid, host);
+            var errorPath = ProxyAccessLogs.ErrorLogPath(_config.System.RootDirectory, space.Uuid, host);
+
+            sb.AppendLine($"# {host} access log: {accessPath}");
+            var access = ProxyAccessLogs.SearchFile(accessPath, query, searchScanLines, lines, regex);
+            sb.AppendLine(string.IsNullOrWhiteSpace(access.Text)
+                ? "(no requests logged yet)"
+                : access.Text.TrimEnd());
+
+            var error = ProxyAccessLogs.SearchFile(errorPath, query, searchScanLines, Math.Min(lines, 200), regex);
+            if (!string.IsNullOrWhiteSpace(error.Text))
+            {
+                sb.AppendLine($"# {host} error log: {errorPath}");
+                sb.AppendLine(error.Text.TrimEnd());
+            }
+        }
+
+        return sb.ToString();
     }
 
     public object GetProxyLogs(
@@ -1089,12 +1137,99 @@ public sealed class WebSpaceStore : IWebSpaceFsAccess
         var space = Get(uuid) ?? throw new InvalidOperationException($"WebSpace {uuid} not found.");
         if (!WebSpaceRuntime.NeedsContainer(space.Runtime))
         {
-            yield return "(static WebSpace no runtime container logs)";
+            // No container console exists; the history was already sent by the console
+            // endpoint, so only stream newly appended access log lines here.
+            await foreach (var line in FollowStaticAccessLogsAsync(space, cancellationToken))
+                yield return line;
             yield break;
         }
 
         await foreach (var line in _runtime.FollowLogsAsync(uuid, sinceLines, cancellationToken))
             yield return line;
+    }
+
+    /// <summary>
+    /// Streams newly appended web server access log lines for WebSpaces without a container.
+    /// Handles rotation by restarting at the beginning of the file when it shrinks.
+    /// </summary>
+    private async IAsyncEnumerable<string> FollowStaticAccessLogsAsync(
+        WebSpace space,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        var offsets = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        var buffers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var host in space.Domains.Where(d => !string.IsNullOrWhiteSpace(d)))
+        {
+            var path = ProxyAccessLogs.AccessLogPath(_config.System.RootDirectory, space.Uuid, host);
+            offsets[path] = FileLength(path);
+            buffers[path] = "";
+        }
+
+        while (offsets.Count > 0)
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // fall through to the cancellation check below
+            }
+
+            if (cancellationToken.IsCancellationRequested)
+                yield break;
+
+            foreach (var path in offsets.Keys.ToList())
+            {
+                var length = FileLength(path);
+                if (length < offsets[path])
+                {
+                    // Rotated or truncated - start over so the new file is picked up.
+                    offsets[path] = 0;
+                    buffers[path] = "";
+                }
+
+                if (length <= offsets[path])
+                    continue;
+
+                string chunk;
+                long position;
+                try
+                {
+                    await using var stream = new FileStream(
+                        path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                    stream.Seek(offsets[path], SeekOrigin.Begin);
+                    using var reader = new StreamReader(stream);
+                    chunk = await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
+                    position = stream.Position;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    continue;
+                }
+
+                offsets[path] = position;
+                var text = buffers[path] + chunk;
+                var parts = text.Split('\n');
+                buffers[path] = parts[^1];
+                for (var i = 0; i < parts.Length - 1; i++)
+                    yield return parts[i].TrimEnd('\r');
+            }
+        }
+    }
+
+    private static long FileLength(string path)
+    {
+        try
+        {
+            var info = new FileInfo(path);
+            return info.Exists ? info.Length : 0;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return 0;
+        }
     }
 
     /// <summary>Send a console command to the WebSpace runtime stdin.</summary>
