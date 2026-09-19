@@ -209,7 +209,14 @@ public sealed class ReverseProxyManager
                 return;
             }
 
-            var desired = $"# Managed by FeatherQuilld - do not edit by hand{Environment.NewLine}include {generatedConfigPath};{Environment.NewLine}";
+            // Quote the path and escape any embedded backslashes/quotes so a root
+            // directory containing spaces or special characters still produces a
+            // valid `include` directive instead of silently truncating the path
+            // or breaking the nginx config.
+            var escapedPath = generatedConfigPath
+                .Replace("\\", "\\\\", StringComparison.Ordinal)
+                .Replace("\"", "\\\"", StringComparison.Ordinal);
+            var desired = $"# Managed by FeatherQuilld - do not edit by hand{Environment.NewLine}include \"{escapedPath}\";{Environment.NewLine}";
 
             if (File.Exists(includePath))
             {
