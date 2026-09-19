@@ -110,6 +110,11 @@ public sealed class WebSpaceRuntime : IDisposable
             return;
         }
 
+        // PHP/Apache runs as www-data while the installer and uploads write as root. The
+        // FUSE quota mount presents everything as root and ignores chown from inside the
+        // container, so fix the ownership on the source volume before the runtime starts.
+        WebSpaceFsOwnership.EnsureWebServerOwnership(space, dataPath, _logger);
+
         if (space.BackendPort <= 0)
             throw new InvalidOperationException("backend_port must be allocated before start.");
 

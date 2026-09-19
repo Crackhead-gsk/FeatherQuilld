@@ -21,19 +21,25 @@ public sealed class FuseQuotaLimiter
     private readonly string _mountPath;
     private readonly string _socketPath;
     private readonly long _diskLimitBytes;
+    private readonly int? _ownerUid;
+    private readonly int? _ownerGid;
 
     public FuseQuotaLimiter(
         AppConfig config,
         Guid webSpaceUuid,
         string sourcePath,
         long diskLimitBytes,
-        AppLogger? logger = null)
+        AppLogger? logger = null,
+        int? ownerUid = null,
+        int? ownerGid = null)
     {
         _config = config;
         _logger = logger;
         _webSpaceUuid = webSpaceUuid;
         _sourcePath = sourcePath;
         _diskLimitBytes = diskLimitBytes;
+        _ownerUid = ownerUid;
+        _ownerGid = ownerGid;
         _mountPath = GetMountPath(config.System, webSpaceUuid);
         _socketPath = _mountPath + ".fqsock";
     }
@@ -234,8 +240,8 @@ public sealed class FuseQuotaLimiter
     private async Task SpawnDaemonAsync(CancellationToken cancellationToken)
     {
         var bin = ResolveBinaryPath(_config.System);
-        var uid = _config.System.User.Uid;
-        var gid = _config.System.User.Gid;
+        var uid = _ownerUid ?? _config.System.User.Uid;
+        var gid = _ownerGid ?? _config.System.User.Gid;
 
         var psi = new ProcessStartInfo
         {

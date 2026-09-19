@@ -174,6 +174,10 @@ public static class WebSpacePhpExtensions
             if [ -f "$ADDONS" ]; then
               cp "$ADDONS" /etc/apache2/sites-enabled/zzz-featherquilld-addons.conf
             fi
+            # Apache/PHP laeuft als www-data (uid 33), der Installer/Uploader aber als root.
+            # Ohne chown kann die App nichts schreiben (WordPress kann wp-config.php nicht
+            # anlegen, keine Uploads, keine Plugin-/Core-Updates).
+            chown -R www-data:www-data /var/www/html 2>/dev/null || true
             exec apache2-foreground
             """.ReplaceLineEndings("\n");
     }

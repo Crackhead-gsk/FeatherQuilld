@@ -237,7 +237,9 @@ public sealed class WebSpaceStore : IWebSpaceFsAccess
                 if (useFuse)
                 {
                     var limiter = new FuseQuotaLimiter(
-                        _config, space.Uuid, dataPath, space.DiskLimitBytes, _logger);
+                        _config, space.Uuid, dataPath, space.DiskLimitBytes, _logger,
+                        ownerUid: WebSpaceFsOwnership.MountOwnerUid(space.Runtime),
+                        ownerGid: WebSpaceFsOwnership.MountOwnerGid(space.Runtime));
                     limiter.Setup();
                     limiter.StartupAsync().GetAwaiter().GetResult();
                 }
@@ -1706,7 +1708,9 @@ public sealed class WebSpaceStore : IWebSpaceFsAccess
             try
             {
                 var limiter = new FuseQuotaLimiter(
-                    _config, space.Uuid, DataPath(space.Uuid), space.DiskLimitBytes, _logger);
+                    _config, space.Uuid, DataPath(space.Uuid), space.DiskLimitBytes, _logger,
+                    ownerUid: WebSpaceFsOwnership.MountOwnerUid(space.Runtime),
+                    ownerGid: WebSpaceFsOwnership.MountOwnerGid(space.Runtime));
                 limiter.Setup();
                 limiter.StartupAsync().GetAwaiter().GetResult();
             }
