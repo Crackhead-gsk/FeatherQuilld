@@ -118,7 +118,7 @@ public static class WebSpaceFsOwnership
         return null;
     }
 
-    private static string UnescapeMountField(string value) =>
+    internal static string UnescapeMountField(string value) =>
         value.Replace("\\040", " ", StringComparison.Ordinal)
              .Replace("\\011", "\t", StringComparison.Ordinal)
              .Replace("\\012", "\n", StringComparison.Ordinal)
