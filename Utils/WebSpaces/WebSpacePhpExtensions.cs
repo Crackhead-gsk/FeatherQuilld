@@ -157,22 +157,22 @@ public static class WebSpacePhpExtensions
             set -e
             NEED_INSTALL=0
             for ext in {{needCheck}}; do
-              if ! php -m 2>/dev/null | grep -qi "^$${ext}$"; then
+              if ! php -m 2>/dev/null | grep -qi "^${ext}$"; then
                 NEED_INSTALL=1
                 break
               fi
             done
-            if [ "$$NEED_INSTALL" = "1" ]; then
+            if [ "$NEED_INSTALL" = "1" ]; then
               export DEBIAN_FRONTEND=noninteractive
               apt-get update -qq
-              apt-get install -y -qq --no-install-recommends $$PHPIZE_DEPS {{aptList}} unzip >/dev/null
+              apt-get install -y -qq --no-install-recommends $PHPIZE_DEPS {{aptList}} unzip >/dev/null
             {{installBody}}
               a2enmod rewrite >/dev/null 2>&1 || true
               rm -rf /var/lib/apt/lists/*
             fi
             ADDONS=/var/www/html/.featherquilld/apache-addons.conf
-            if [ -f "$$ADDONS" ]; then
-              cp "$$ADDONS" /etc/apache2/sites-enabled/zzz-featherquilld-addons.conf
+            if [ -f "$ADDONS" ]; then
+              cp "$ADDONS" /etc/apache2/sites-enabled/zzz-featherquilld-addons.conf
             fi
             exec apache2-foreground
             """.ReplaceLineEndings("\n");
