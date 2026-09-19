@@ -79,6 +79,9 @@ public class WebSpaceFsOwnershipTests
         if (OperatingSystem.IsWindows())
             return; // chown is a POSIX operation; this asserts the actual Linux behavior.
 
+        if (!IsRunningAsRoot())
+            return; // chown to an arbitrary uid/gid needs root (or CAP_CHOWN); CI runs unprivileged.
+
         var dir = Path.Combine(Path.GetTempPath(), "fq-ownership-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         var file = Path.Combine(dir, "wp-config.php");
@@ -105,6 +108,30 @@ public class WebSpaceFsOwnershipTests
         finally
         {
             try { Directory.Delete(dir, true); } catch { /* ignore */ }
+        }
+    }
+
+    private static bool IsRunningAsRoot()
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "id",
+                Arguments = "-u",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+            };
+            using var proc = System.Diagnostics.Process.Start(psi);
+            if (proc is null)
+                return false;
+            var output = proc.StandardOutput.ReadToEnd().Trim();
+            proc.WaitForExit(5000);
+            return output == "0";
+        }
+        catch
+        {
+            return false;
         }
     }
 }
