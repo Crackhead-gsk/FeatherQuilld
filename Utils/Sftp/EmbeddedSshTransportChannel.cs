@@ -7,13 +7,29 @@ internal sealed class EmbeddedSshTransportChannel : ISftpTransportChannel, IAsyn
 {
     private readonly SshChannel _channel;
     private readonly CancellationTokenSource _cts = new();
-    private readonly Task _pump;
+    private Task? _pump;
     private int _closed;
 
     public EmbeddedSshTransportChannel(SshChannel channel)
     {
         _channel = channel ?? throw new ArgumentNullException(nameof(channel));
-        _pump = Task.Run(PumpAsync);
+        // NOTE: the pump is deliberately NOT started here. It must only start
+        // after the SFTP session has subscribed to DataReceived (see Start()):
+        // starting it in the constructor lets the pump race ahead of the
+        // subscription and consume — and silently DROP — the client's INIT
+        // packet that may already be buffered on the channel, after which the
+        // session waits forever for a packet that will never come and the
+        // client hangs.
+    }
+
+    /// <summary>
+    /// Starts the read pump. Call only AFTER the session has subscribed to
+    /// <see cref="DataReceived"/>, so no incoming data can be consumed (and
+    /// dropped) before a subscriber exists.
+    /// </summary>
+    public void Start()
+    {
+        _pump ??= Task.Run(PumpAsync);
     }
 
     public event EventHandler<byte[]>? DataReceived;
@@ -75,7 +91,10 @@ internal sealed class EmbeddedSshTransportChannel : ISftpTransportChannel, IAsyn
     public async ValueTask DisposeAsync()
     {
         RaiseClosed();
-        try { await _pump.ConfigureAwait(false); } catch { /* ignore */ }
+        if (_pump is not null)
+        {
+            try { await _pump.ConfigureAwait(false); } catch { /* ignore */ }
+        }
         _cts.Dispose();
     }
 }
