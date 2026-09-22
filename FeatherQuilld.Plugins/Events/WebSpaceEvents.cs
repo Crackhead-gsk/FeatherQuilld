@@ -107,3 +107,68 @@ public sealed class WebSpaceExecAfterEvent
     public Exception? Error { get; init; }
     public bool Success => Error is null;
 }
+
+public sealed class WebSpaceRedisBeforeEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+    public required bool Enabled { get; init; }
+}
+
+public sealed class WebSpaceRedisAfterEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+    public required bool Enabled { get; init; }
+    public Exception? Error { get; init; }
+    public bool Success => Error is null;
+}
+
+public sealed class WebSpaceAbortInstallBeforeEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+}
+
+public sealed class WebSpaceAbortInstallAfterEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+    public bool Aborted { get; init; }
+    public Exception? Error { get; init; }
+    public bool Success => Error is null;
+}
+
+public sealed class WebSpaceRecreateRuntimeBeforeEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+}
+
+public sealed class WebSpaceRecreateRuntimeAfterEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+    public Exception? Error { get; init; }
+    public bool Success => Error is null;
+}
+
+public sealed class WebSpaceSslUploadBeforeEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+}
+
+public sealed class WebSpaceSslUploadAfterEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+    public object? Result { get; init; }
+    public Exception? Error { get; init; }
+    public bool Success => Error is null;
+}
+
+public sealed class WebSpaceSslDeleteBeforeEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+}
+
+public sealed class WebSpaceSslDeleteAfterEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+    public object? Result { get; init; }
+    public Exception? Error { get; init; }
+    public bool Success => Error is null;
+}

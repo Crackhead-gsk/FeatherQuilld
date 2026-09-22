@@ -2,11 +2,16 @@ using System.Reflection;
 using System.Runtime.Loader;
 using FeatherQuilld.Plugins.Abstractions;
 using FeatherQuilld.Plugins.Events;
+using FeatherQuilld.Plugins.Host;
+using FeatherQuilld.Plugins.Metadata;
 using FeatherQuilld.Plugins.Routing;
 using FeatherQuilld.Utils.Plugins.Events;
+using FeatherQuilld.Utils.Plugins.Host;
 using FeatherQuilld.Utils.Plugins.Routing;
 using FeatherQuilld.Utils.Config.System;
+using FeatherQuilld.Utils.Services;
 using FeatherQuilld.Utils.Startup;
+using FeatherQuilld.Utils.WebSpaces;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -16,6 +21,7 @@ using ConfigModel = FeatherQuilld.Utils.Config.Config;
 using HostLogger = FeatherQuilld.Utils.Logger.Logger;
 using LoggerTypes = FeatherQuilld.Utils.Logger.LoggerTypes;
 using PluginContext = FeatherQuilld.Plugins.Context.PluginContext;
+using PluginMetadata = FeatherQuilld.Plugins.Metadata.PluginMetadata;
 
 namespace FeatherQuilld.Utils.Plugins;
 
@@ -30,6 +36,7 @@ public sealed class PluginManager
     private readonly ConfigModel _config;
     private readonly HostLogger _logger;
     private readonly List<LoadedPlugin> _plugins = [];
+    private IServiceProvider? _services;
 
     public EventBus EventBus { get; } = new();
     public RouteRegistry RouteRegistry { get; } = new();
@@ -79,10 +86,11 @@ public sealed class PluginManager
                     continue;
                 }
 
-                var plugin = LoadFromAssembly(candidate.AssemblyPath);
+                var (plugin, loadContext) = LoadFromAssembly(candidate.AssemblyPath);
                 if (plugin is null)
                 {
                     reporter?.Detail($"skipped {candidate.FolderName} (no IPlugin)");
+                    loadContext?.Unload();
                     continue;
                 }
 
@@ -96,6 +104,8 @@ public sealed class PluginManager
                     foreach (var error in errors)
                         _logger.Warning(LoggerTypes.PluginLoader, $"{candidate.AssemblyPath}: {error}");
 
+                    loadContext?.Unload();
+
                     if (pluginsConfig.Strict)
                         throw new InvalidOperationException($"Plugin verification failed: {meta.Id}");
 
@@ -106,6 +116,7 @@ public sealed class PluginManager
                 if (pluginsConfig.Disabled.Contains(meta.Id, StringComparer.OrdinalIgnoreCase))
                 {
                     reporter?.Detail($"skipped {meta.Id} (disabled in config)");
+                    loadContext?.Unload();
                     continue;
                 }
 
@@ -117,25 +128,20 @@ public sealed class PluginManager
                     Directory = candidate.Directory,
                     AssemblyPath = candidate.AssemblyPath,
                     Manifest = candidate.Manifest,
+                    LoadContext = loadContext,
+                    EffectiveMetadata = meta,
                 });
-
-                reporter?.Detail($"{meta.Name} v{meta.Version} ({meta.Id})");
-                _logger.Info(LoggerTypes.PluginLoader,
-                    $"Loaded plugin '{meta.Name}' v{meta.Version} ({meta.Id}) from {candidate.Directory}");
+                reporter?.Detail($"loaded {meta.Id} v{meta.Version}");
             }
-            catch (Exception ex) when (ex is not InvalidOperationException)
+            catch (Exception ex)
             {
-                reporter?.Detail($"failed {candidate.FolderName}: {ex.Message}");
-                _logger.Error(LoggerTypes.PluginLoader, $"Failed to load {candidate.AssemblyPath}", ex);
+                reporter?.Detail($"load failed: {candidate.FolderName}");
+                _logger.Error(LoggerTypes.PluginLoader, $"Failed loading {candidate.AssemblyPath}", ex);
                 result.Status = BootStepStatus.Warning;
-
                 if (pluginsConfig.Strict)
                     throw;
             }
         }
-
-        if (_plugins.Count == 0 && result.Status == BootStepStatus.Success)
-            reporter?.Detail("no valid plugins loaded");
 
         _logger.Info(LoggerTypes.PluginLoader, $"{_plugins.Count} plugin(s) ready");
         return result;
@@ -151,37 +157,61 @@ public sealed class PluginManager
         services.AddSingleton<IRouteRegistry>(RouteRegistry);
         services.AddSingleton(this);
 
-        foreach (var loaded in _plugins)
+        foreach (var loaded in _plugins.ToList())
         {
-            var meta = loaded.Instance.Metadata;
+            var meta = loaded.EffectiveMetadata ?? loaded.Instance.Metadata;
             var pluginLogger = new PluginLogger(_logger, meta.Id);
+            var settings = GetPluginSettings(meta.Id, meta, loaded.Manifest);
+            var ownedEvents = new OwningEventBus(EventBus);
+            loaded.OwnedEvents = ownedEvents;
+
+            var configFacade = new PluginConfigFacade(meta.Id, settings, meta.Capabilities);
+            var host = BuildHost(configFacade);
 
             var context = new PluginContext
             {
                 Metadata = meta,
                 Services = services,
-                Events = EventBus,
+                Events = ownedEvents,
                 Routes = RouteRegistry,
                 Logger = pluginLogger,
-                Settings = GetPluginSettings(meta.Id),
+                Host = host,
+                Settings = settings,
             };
 
             loaded.Context = context;
 
+            RouteRegistry.BeginPlugin(meta.Id, meta.Capabilities, _config.Plugins.Strict);
             try
             {
                 loaded.Instance.Configure(context);
                 reporter?.Detail($"configured {meta.Id}");
                 _logger.Debug(LoggerTypes.Plugin, $"Configured '{meta.Id}'");
             }
+            catch (PluginCapabilityException ex)
+            {
+                reporter?.Detail($"configure capability denied: {meta.Id} ({ex.Capability})");
+                _logger.Warning(LoggerTypes.Plugin, ex.Message);
+                ownedEvents.Dispose();
+                RouteRegistry.DisablePlugin(meta.Id);
+                _plugins.Remove(loaded);
+                result.Status = BootStepStatus.Warning;
+                if (_config.Plugins.Strict)
+                    throw;
+            }
             catch (Exception ex)
             {
                 reporter?.Detail($"configure failed: {meta.Id}");
                 _logger.Error(LoggerTypes.Plugin, $"Configure failed for '{meta.Id}'", ex);
+                ownedEvents.Dispose();
                 result.Status = BootStepStatus.Warning;
 
                 if (_config.Plugins.Strict)
                     throw;
+            }
+            finally
+            {
+                RouteRegistry.EndPlugin();
             }
         }
 
@@ -191,8 +221,8 @@ public sealed class PluginManager
         {
             EventBus.Emit(new PluginConfiguredEvent
             {
-                PluginId = loaded.Instance.Metadata.Id,
-                PluginName = loaded.Instance.Metadata.Name,
+                PluginId = loaded.EffectiveMetadata.Id,
+                PluginName = loaded.EffectiveMetadata.Name,
             });
         }
 
@@ -221,16 +251,118 @@ public sealed class PluginManager
 
     public void OnApplicationStarted(IServiceProvider services)
     {
+        _services = services;
         EventBus.Emit(new ApplicationStartedEvent { Services = services });
 
         foreach (var loaded in _plugins)
-            _logger.Info(LoggerTypes.Plugin, $"'{loaded.Instance.Metadata.Id}' started");
+        {
+            if (loaded.Instance is IPluginLifecycle lifecycle)
+            {
+                try
+                {
+                    lifecycle.StartAsync(CancellationToken.None).GetAwaiter().GetResult();
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error(LoggerTypes.Plugin,
+                        $"StartAsync failed for '{loaded.EffectiveMetadata.Id}'", ex);
+                }
+            }
+
+            _logger.Info(LoggerTypes.Plugin, $"'{loaded.EffectiveMetadata.Id}' started");
+        }
     }
 
     public async Task OnApplicationStoppingAsync(CancellationToken cancellationToken)
     {
+        foreach (var loaded in _plugins.ToList())
+        {
+            if (loaded.Instance is IPluginLifecycle lifecycle)
+            {
+                try
+                {
+                    await lifecycle.StopAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warning(LoggerTypes.Plugin,
+                        $"StopAsync failed for '{loaded.EffectiveMetadata.Id}': {ex.Message}");
+                }
+            }
+        }
+
         await EventBus.EmitAsync(new ApplicationStoppingEvent { CancellationToken = cancellationToken },
             cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Soft-unload a plugin: stop lifecycle, dispose subscriptions, disable routes, unload ALC.
+    /// MVC application parts remain until process restart.
+    /// </summary>
+    public async Task<bool> UnloadAsync(string pluginId, CancellationToken cancellationToken = default)
+    {
+        var loaded = _plugins.FirstOrDefault(p =>
+            string.Equals(p.EffectiveMetadata.Id, pluginId, StringComparison.OrdinalIgnoreCase));
+        if (loaded is null)
+            return false;
+
+        if (loaded.Instance is IPluginLifecycle lifecycle)
+        {
+            try
+            {
+                await lifecycle.StopAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.Warning(LoggerTypes.Plugin, $"StopAsync during unload of '{pluginId}': {ex.Message}");
+            }
+        }
+
+        loaded.OwnedEvents?.Dispose();
+        RouteRegistry.DisablePlugin(pluginId);
+        _plugins.Remove(loaded);
+
+        try
+        {
+            loaded.LoadContext?.Unload();
+        }
+        catch (Exception ex)
+        {
+            _logger.Warning(LoggerTypes.Plugin, $"ALC unload for '{pluginId}': {ex.Message}");
+        }
+
+        _logger.Info(LoggerTypes.Plugin, $"Unloaded plugin '{pluginId}' (MVC parts require process restart)");
+        return true;
+    }
+
+    private IPluginHost BuildHost(PluginConfigFacade configFacade)
+    {
+        var daemon = new DaemonInfoFacade(
+            configFacade,
+            () => StartupBanner.Version,
+            () => _config.Uuid.ToString(),
+            () => _services?.GetService<DaemonState>()?.UptimeSeconds ?? 0);
+
+        var spaces = new WebSpaceLookupFacade(
+            configFacade,
+            uuid =>
+            {
+                var space = _services?.GetService<WebSpaceStore>()?.Get(uuid);
+                return space is null
+                    ? null
+                    : new WebSpaceSummary(space.Uuid, space.Name, space.Runtime, space.Status);
+            },
+            () =>
+            {
+                var store = _services?.GetService<WebSpaceStore>();
+                if (store is null)
+                    return Array.Empty<WebSpaceSummary>();
+                return store.List()
+                    .Select(s => new WebSpaceSummary(s.Uuid, s.Name, s.Runtime, s.Status))
+                    .ToList();
+            });
+
+        return new PluginHostFacade(daemon, spaces, configFacade);
     }
 
     private IEnumerable<PluginCandidate> DiscoverCandidates(string root)
@@ -249,7 +381,6 @@ public sealed class PluginManager
             }
         }
 
-        // Flat fallback: *.dll directly in the plugins root (legacy layout).
         foreach (var dll in Directory.EnumerateFiles(root, "*.dll"))
         {
             if (IsSkippedAssembly(dll))
@@ -307,14 +438,16 @@ public sealed class PluginManager
         }
     }
 
-    private static FeatherQuilld.Plugins.Metadata.PluginMetadata MergeMetadata(
-        FeatherQuilld.Plugins.Metadata.PluginMetadata fromPlugin,
-        PluginManifest? manifest)
+    private static PluginMetadata MergeMetadata(PluginMetadata fromPlugin, PluginManifest? manifest)
     {
         if (manifest is null)
             return fromPlugin;
 
-        return new FeatherQuilld.Plugins.Metadata.PluginMetadata
+        var capabilities = manifest.Capabilities.Count > 0
+            ? (IReadOnlyList<string>)manifest.Capabilities
+            : fromPlugin.Capabilities;
+
+        return new PluginMetadata
         {
             Id = manifest.Id ?? fromPlugin.Id,
             Name = manifest.Name ?? fromPlugin.Name,
@@ -322,10 +455,12 @@ public sealed class PluginManager
             Description = manifest.Description ?? fromPlugin.Description,
             Author = manifest.Author ?? fromPlugin.Author,
             MinHostVersion = manifest.MinHostVersion ?? fromPlugin.MinHostVersion,
+            Capabilities = capabilities,
+            Settings = fromPlugin.Settings,
         };
     }
 
-    private static IPlugin? LoadFromAssembly(string dllPath)
+    private static (IPlugin? Plugin, AssemblyLoadContext? Context) LoadFromAssembly(string dllPath)
     {
         var loadContext = new PluginLoadContext(dllPath);
         var assembly = loadContext.LoadFromAssemblyPath(Path.GetFullPath(dllPath));
@@ -335,16 +470,17 @@ public sealed class PluginManager
             .ToList();
 
         if (pluginTypes.Count == 0)
-            return null;
+            return (null, loadContext);
 
         if (pluginTypes.Count > 1)
             throw new InvalidOperationException($"Multiple IPlugin implementations in {dllPath}");
 
-        return (IPlugin?)Activator.CreateInstance(pluginTypes[0]);
+        var plugin = (IPlugin?)Activator.CreateInstance(pluginTypes[0]);
+        return (plugin, loadContext);
     }
 
     private static List<string> Verify(
-        FeatherQuilld.Plugins.Metadata.PluginMetadata meta,
+        PluginMetadata meta,
         Version hostVersion,
         ISet<string> seenIds,
         PluginsConfig config)
@@ -377,8 +513,30 @@ public sealed class PluginManager
             ? configured
             : Path.Combine(SystemConfig.DefaultRootDirectory, configured);
 
-    private IReadOnlyDictionary<string, object?> GetPluginSettings(string pluginId) =>
-        new Dictionary<string, object?>();
+    public IReadOnlyDictionary<string, object?> GetPluginSettings(
+        string pluginId,
+        PluginMetadata meta,
+        PluginManifest? manifest)
+    {
+        var merged = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (key, value) in meta.Settings)
+            merged[key] = value;
+
+        if (manifest?.Settings is not null)
+        {
+            foreach (var (key, value) in manifest.Settings)
+                merged[key] = value;
+        }
+
+        if (_config.Plugins.Settings.TryGetValue(pluginId, out var hostSettings) && hostSettings is not null)
+        {
+            foreach (var (key, value) in hostSettings)
+                merged[key] = value;
+        }
+
+        return merged;
+    }
 
     private static bool IsSkippedAssembly(string dllPath)
     {
@@ -394,7 +552,7 @@ public sealed class PluginManager
         string AssemblyPath,
         PluginManifest? Manifest);
 
-    private sealed class PluginLoadContext(string pluginPath) : AssemblyLoadContext(isCollectible: false)
+    private sealed class PluginLoadContext(string pluginPath) : AssemblyLoadContext(isCollectible: true)
     {
         private readonly AssemblyDependencyResolver _resolver = new(pluginPath);
 

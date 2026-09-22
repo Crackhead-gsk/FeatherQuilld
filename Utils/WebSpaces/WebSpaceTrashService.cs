@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using FeatherQuilld.Plugins.Events;
 
 namespace FeatherQuilld.Utils.WebSpaces;
 
@@ -17,8 +18,13 @@ public sealed class WebSpaceTrashService
     };
 
     private readonly IWebSpaceFsAccess _spaces;
+    private readonly IEventBus _events;
 
-    public WebSpaceTrashService(IWebSpaceFsAccess spaces) => _spaces = spaces;
+    public WebSpaceTrashService(IWebSpaceFsAccess spaces, IEventBus? events = null)
+    {
+        _spaces = spaces;
+        _events = events.OrNoOp();
+    }
 
     public static bool IsTrashPath(string? relativePath)
     {
@@ -133,6 +139,16 @@ public sealed class WebSpaceTrashService
 
     public void RestoreTrash(Guid uuid, IEnumerable<string> ids, bool overwrite)
     {
+        var idList = ids as IList<string> ?? ids.ToList();
+        var path = string.Join(",", idList.Where(i => !string.IsNullOrWhiteSpace(i)));
+        _events.WithHooks(
+            new TrashRestoreBeforeEvent { WebSpaceUuid = uuid, Path = path },
+            err => new TrashRestoreAfterEvent { WebSpaceUuid = uuid, Path = path, Error = err },
+            () => RestoreTrashCore(uuid, idList, overwrite));
+    }
+
+    private void RestoreTrashCore(Guid uuid, IEnumerable<string> ids, bool overwrite)
+    {
         var root = RequireRoot(uuid);
         var trashRoot = Path.Combine(root, TrashDirName);
 
@@ -181,6 +197,16 @@ public sealed class WebSpaceTrashService
 
     public void DeleteTrashEntries(Guid uuid, IEnumerable<string> ids)
     {
+        var idList = ids as IList<string> ?? ids.ToList();
+        var path = string.Join(",", idList.Where(i => !string.IsNullOrWhiteSpace(i)));
+        _events.WithHooks(
+            new TrashPurgeBeforeEvent { WebSpaceUuid = uuid, Path = path },
+            err => new TrashPurgeAfterEvent { WebSpaceUuid = uuid, Path = path, Error = err },
+            () => DeleteTrashEntriesCore(uuid, idList));
+    }
+
+    private void DeleteTrashEntriesCore(Guid uuid, IEnumerable<string> ids)
+    {
         var root = RequireRoot(uuid);
         var trashRoot = Path.Combine(root, TrashDirName);
         foreach (var id in ids)
@@ -193,7 +219,13 @@ public sealed class WebSpaceTrashService
         }
     }
 
-    public void EmptyTrash(Guid uuid)
+    public void EmptyTrash(Guid uuid) =>
+        _events.WithHooks(
+            new TrashPurgeBeforeEvent { WebSpaceUuid = uuid, Path = "*" },
+            err => new TrashPurgeAfterEvent { WebSpaceUuid = uuid, Path = "*", Error = err },
+            () => EmptyTrashCore(uuid));
+
+    private void EmptyTrashCore(Guid uuid)
     {
         var root = RequireRoot(uuid);
         var trashRoot = Path.Combine(root, TrashDirName);

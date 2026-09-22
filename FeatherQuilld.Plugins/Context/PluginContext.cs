@@ -1,4 +1,5 @@
 using FeatherQuilld.Plugins.Events;
+using FeatherQuilld.Plugins.Host;
 using FeatherQuilld.Plugins.Metadata;
 using FeatherQuilld.Plugins.Routing;
 using Microsoft.Extensions.DependencyInjection;
@@ -15,7 +16,10 @@ public sealed class PluginContext
     public required IRouteRegistry Routes { get; init; }
     public required ILogger Logger { get; init; }
 
-    /// <summary>Plugin-specific settings from config (may be empty).</summary>
+    /// <summary>Curated host facades. Null only in unit tests that construct a minimal context.</summary>
+    public IPluginHost? Host { get; init; }
+
+    /// <summary>Plugin-specific settings from manifest + host config (may be empty).</summary>
     public IReadOnlyDictionary<string, object?> Settings { get; init; } =
         new Dictionary<string, object?>();
 }

@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 
 namespace FeatherQuilld.Utils.Ftp;
 
-internal sealed record FtpSessionContext(string RootPath, bool ReadOnly);
+internal sealed record FtpSessionContext(string RootPath, bool ReadOnly, Guid WebSpaceUuid = default);
 
 internal static class FtpSessionStore
 {

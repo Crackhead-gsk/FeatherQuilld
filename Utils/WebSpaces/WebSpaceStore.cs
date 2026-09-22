@@ -458,7 +458,18 @@ public sealed class WebSpaceStore : IWebSpaceFsAccess
     }
 
     /// <summary>Cancel an in-flight WebSpace install or reinstall job.</summary>
-    public bool AbortInstall(Guid uuid)
+    public bool AbortInstall(Guid uuid) =>
+        _events.WithHooks(
+            new WebSpaceAbortInstallBeforeEvent { WebSpaceUuid = uuid },
+            (aborted, err) => new WebSpaceAbortInstallAfterEvent
+            {
+                WebSpaceUuid = uuid,
+                Aborted = aborted,
+                Error = err,
+            },
+            () => AbortInstallCore(uuid));
+
+    private bool AbortInstallCore(Guid uuid)
     {
         if (!_installInFlight.ContainsKey(uuid))
             return false;
@@ -485,7 +496,13 @@ public sealed class WebSpaceStore : IWebSpaceFsAccess
             (_, err) => new WebSpaceSyncAfterEvent { WebSpaceUuid = uuid, Error = err },
             () => ApplyConfigFromPanelCore(uuid));
 
-    public WebSpace RecreateRuntime(Guid uuid)
+    public WebSpace RecreateRuntime(Guid uuid) =>
+        _events.WithHooks(
+            new WebSpaceRecreateRuntimeBeforeEvent { WebSpaceUuid = uuid },
+            (_, err) => new WebSpaceRecreateRuntimeAfterEvent { WebSpaceUuid = uuid, Error = err },
+            () => RecreateRuntimeCore(uuid));
+
+    private WebSpace RecreateRuntimeCore(Guid uuid)
     {
         lock (_mutateGate)
         {
@@ -778,7 +795,18 @@ public sealed class WebSpaceStore : IWebSpaceFsAccess
         };
     }
 
-    public object PutCustomSsl(Guid uuid, Stream certStream, Stream keyStream)
+    public object PutCustomSsl(Guid uuid, Stream certStream, Stream keyStream) =>
+        _events.WithHooks(
+            new WebSpaceSslUploadBeforeEvent { WebSpaceUuid = uuid },
+            (result, err) => new WebSpaceSslUploadAfterEvent
+            {
+                WebSpaceUuid = uuid,
+                Result = result,
+                Error = err,
+            },
+            () => PutCustomSslCore(uuid, certStream, keyStream));
+
+    private object PutCustomSslCore(Guid uuid, Stream certStream, Stream keyStream)
     {
         var space = Get(uuid) ?? throw new InvalidOperationException($"WebSpace {uuid} not found.");
         var paths = CustomSslPaths(uuid);
@@ -797,7 +825,18 @@ public sealed class WebSpaceStore : IWebSpaceFsAccess
         return GetCustomSslStatus(uuid);
     }
 
-    public object DeleteCustomSsl(Guid uuid)
+    public object DeleteCustomSsl(Guid uuid) =>
+        _events.WithHooks(
+            new WebSpaceSslDeleteBeforeEvent { WebSpaceUuid = uuid },
+            (result, err) => new WebSpaceSslDeleteAfterEvent
+            {
+                WebSpaceUuid = uuid,
+                Result = result,
+                Error = err,
+            },
+            () => DeleteCustomSslCore(uuid));
+
+    private object DeleteCustomSslCore(Guid uuid)
     {
         var space = Get(uuid) ?? throw new InvalidOperationException($"WebSpace {uuid} not found.");
         var paths = CustomSslPaths(uuid);
@@ -910,7 +949,18 @@ public sealed class WebSpaceStore : IWebSpaceFsAccess
         };
     }
 
-    public WebSpace SetRedis(Guid uuid, bool enabled)
+    public WebSpace SetRedis(Guid uuid, bool enabled) =>
+        _events.WithHooks(
+            new WebSpaceRedisBeforeEvent { WebSpaceUuid = uuid, Enabled = enabled },
+            (_, err) => new WebSpaceRedisAfterEvent
+            {
+                WebSpaceUuid = uuid,
+                Enabled = enabled,
+                Error = err,
+            },
+            () => SetRedisCore(uuid, enabled));
+
+    private WebSpace SetRedisCore(Guid uuid, bool enabled)
     {
         lock (_mutateGate)
         {

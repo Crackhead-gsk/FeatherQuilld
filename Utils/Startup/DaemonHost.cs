@@ -244,7 +244,8 @@ public sealed class DaemonHost
                 sp.GetRequiredService<WebSpaceStore>(),
                 sp.GetService<AppLogger>(),
                 sp.GetService<Utils.WebSpaces.Malware.MalwareScanJobProgressService>(),
-                sp.GetService<WebSpaceActivityReporter>()));
+                sp.GetService<WebSpaceActivityReporter>(),
+                sp.GetService<FeatherQuilld.Plugins.Events.IEventBus>()));
         builder.Services.AddSingleton<Utils.WebSpaces.WebSpaceUtilizationService>(sp =>
             new Utils.WebSpaces.WebSpaceUtilizationService(
                 sp.GetRequiredService<AppConfig>().Docker,
@@ -283,7 +284,8 @@ public sealed class DaemonHost
         builder.Services.AddSingleton(sp =>
             new Utils.SystemInfo.HostPackageManager(
                 sp.GetService<Utils.SystemInfo.SystemPackageWsHub>(),
-                sp.GetRequiredService<global::FeatherQuilld.Utils.Config.Config>()));
+                sp.GetRequiredService<global::FeatherQuilld.Utils.Config.Config>(),
+                sp.GetService<FeatherQuilld.Plugins.Events.IEventBus>()));
         builder.Services.AddHostedService<Utils.Sftp.SftpHostedService>();
         builder.Services.AddFeatherQuilldFtp(config);
         builder.Services.AddHostedService<Utils.Ftp.FtpHostedService>();

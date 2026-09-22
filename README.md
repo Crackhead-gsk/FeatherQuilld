@@ -165,6 +165,12 @@ make package          # build prod .deb and upload to Nexus if creds set
 
 ---
 
+## Plugins
+
+The daemon loads plugins from the configured plugins directory. See [docs/plugins.md](docs/plugins.md) for the SDK authoring guide (capabilities, settings, events, soft unload). Sample: `plugins/Hello/`.
+
+---
+
 ## Architecture
 
 FeatherQuilld integrates with FeatherPanel via the `/api/quilld-remote/*` API prefix using a dedicated `fqld_` Bearer token separate from game node tokens. Configuration is two-phase:

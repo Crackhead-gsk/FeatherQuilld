@@ -2,6 +2,7 @@ using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using FeatherQuilld.Plugins.Events;
 using AppConfig = FeatherQuilld.Utils.Config.Config;
 
 namespace FeatherQuilld.Utils.Dns;
@@ -16,10 +17,12 @@ public sealed class PowerDnsManager
 
     private readonly AppConfig _config;
     private readonly HttpClient _client;
+    private readonly IEventBus _events;
 
-    public PowerDnsManager(AppConfig config)
+    public PowerDnsManager(AppConfig config, IEventBus? events = null)
     {
         _config = config;
+        _events = events.OrNoOp();
         var apiKey = PowerDnsProbe.ResolveApiKey(config);
         if (apiKey.Length == 0)
             throw new InvalidOperationException("PowerDNS API key is not configured.");
@@ -67,26 +70,32 @@ public sealed class PowerDnsManager
     public string CreateZone(string zoneName, string? nodeIp = null)
     {
         zoneName = NormalizeZoneName(zoneName);
-        var payload = new
-        {
-            name = zoneName,
-            kind = "Native",
-            nameservers = new[] { $"ns1.{TrimZoneId(zoneName)}." },
-        };
-        using var response = _client.PostAsJsonAsync("/api/v1/servers/localhost/zones", payload, JsonOptions)
-            .GetAwaiter()
-            .GetResult();
-        if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
-        {
-            if (!string.IsNullOrWhiteSpace(nodeIp))
-                SeedZoneGlue(zoneName, nodeIp.Trim());
-            return TrimZoneId(zoneName);
-        }
+        return _events.WithHooks(
+            new DnsZoneCreateBeforeEvent { ZoneName = TrimZoneId(zoneName) },
+            (_, err) => new DnsZoneCreateAfterEvent { ZoneName = TrimZoneId(zoneName), Error = err },
+            () =>
+            {
+                var payload = new
+                {
+                    name = zoneName,
+                    kind = "Native",
+                    nameservers = new[] { $"ns1.{TrimZoneId(zoneName)}." },
+                };
+                using var response = _client.PostAsJsonAsync("/api/v1/servers/localhost/zones", payload, JsonOptions)
+                    .GetAwaiter()
+                    .GetResult();
+                if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
+                {
+                    if (!string.IsNullOrWhiteSpace(nodeIp))
+                        SeedZoneGlue(zoneName, nodeIp.Trim());
+                    return TrimZoneId(zoneName);
+                }
 
-        response.EnsureSuccessStatusCode();
-        if (!string.IsNullOrWhiteSpace(nodeIp))
-            SeedZoneGlue(zoneName, nodeIp.Trim());
-        return TrimZoneId(zoneName);
+                response.EnsureSuccessStatusCode();
+                if (!string.IsNullOrWhiteSpace(nodeIp))
+                    SeedZoneGlue(zoneName, nodeIp.Trim());
+                return TrimZoneId(zoneName);
+            });
     }
 
     /// <summary>Default NS hostnames for a new apex zone.</summary>
@@ -183,7 +192,17 @@ public sealed class PowerDnsManager
         return new { records = pageRecords, page, per_page = perPage, total_count = total };
     }
 
-    public Dictionary<string, object?> CreateRecord(string zoneId, Dictionary<string, object?> payload)
+    public Dictionary<string, object?> CreateRecord(string zoneId, Dictionary<string, object?> payload) =>
+        _events.WithHooks(
+            new DnsRecordCreateBeforeEvent { ZoneId = TrimZoneId(NormalizeZoneName(zoneId)) },
+            (_, err) => new DnsRecordCreateAfterEvent
+            {
+                ZoneId = TrimZoneId(NormalizeZoneName(zoneId)),
+                Error = err,
+            },
+            () => CreateRecordCore(zoneId, payload));
+
+    private Dictionary<string, object?> CreateRecordCore(string zoneId, Dictionary<string, object?> payload)
     {
         var zone = NormalizeZoneName(zoneId);
         var type = (payload.GetValueOrDefault("type")?.ToString() ?? "").ToUpperInvariant();
@@ -218,7 +237,22 @@ public sealed class PowerDnsManager
         };
     }
 
-    public Dictionary<string, object?> UpdateRecord(string zoneId, string recordId, Dictionary<string, object?> payload)
+    public Dictionary<string, object?> UpdateRecord(string zoneId, string recordId, Dictionary<string, object?> payload) =>
+        _events.WithHooks(
+            new DnsRecordUpdateBeforeEvent
+            {
+                ZoneId = TrimZoneId(NormalizeZoneName(zoneId)),
+                RecordId = recordId,
+            },
+            (_, err) => new DnsRecordUpdateAfterEvent
+            {
+                ZoneId = TrimZoneId(NormalizeZoneName(zoneId)),
+                RecordId = recordId,
+                Error = err,
+            },
+            () => UpdateRecordCore(zoneId, recordId, payload));
+
+    private Dictionary<string, object?> UpdateRecordCore(string zoneId, string recordId, Dictionary<string, object?> payload)
     {
         var zone = NormalizeZoneName(zoneId);
         var (type, name, index) = ParseRecordId(recordId);
@@ -299,7 +333,22 @@ public sealed class PowerDnsManager
         };
     }
 
-    public void DeleteRecord(string zoneId, string recordId)
+    public void DeleteRecord(string zoneId, string recordId) =>
+        _events.WithHooks(
+            new DnsRecordDeleteBeforeEvent
+            {
+                ZoneId = TrimZoneId(NormalizeZoneName(zoneId)),
+                RecordId = recordId,
+            },
+            err => new DnsRecordDeleteAfterEvent
+            {
+                ZoneId = TrimZoneId(NormalizeZoneName(zoneId)),
+                RecordId = recordId,
+                Error = err,
+            },
+            () => DeleteRecordCore(zoneId, recordId));
+
+    private void DeleteRecordCore(string zoneId, string recordId)
     {
         var zone = NormalizeZoneName(zoneId);
         var (type, name, index) = ParseRecordId(recordId);
@@ -334,7 +383,23 @@ public sealed class PowerDnsManager
         PatchRrset(zone, name, type, ttl, contents, changetype: "REPLACE");
     }
 
-    public Dictionary<string, object> UpsertARecord(string zoneId, string name, string ip, int ttl = 300, bool proxied = false)
+    public Dictionary<string, object> UpsertARecord(string zoneId, string name, string ip, int ttl = 300, bool proxied = false) =>
+        _events.WithHooks(
+            new DnsUpsertABeforeEvent
+            {
+                ZoneId = TrimZoneId(NormalizeZoneName(zoneId)),
+                Name = name,
+                Ip = ip,
+            },
+            (_, err) => new DnsUpsertAAfterEvent
+            {
+                ZoneId = TrimZoneId(NormalizeZoneName(zoneId)),
+                Name = name,
+                Error = err,
+            },
+            () => UpsertARecordCore(zoneId, name, ip, ttl, proxied));
+
+    private Dictionary<string, object> UpsertARecordCore(string zoneId, string name, string ip, int ttl = 300, bool proxied = false)
     {
         _ = proxied;
         var zone = NormalizeZoneName(zoneId);
@@ -375,7 +440,22 @@ public sealed class PowerDnsManager
         }
     }
 
-    public Dictionary<string, object> CreateTxtRecord(string zoneId, string name, string content, int ttl = 120)
+    public Dictionary<string, object> CreateTxtRecord(string zoneId, string name, string content, int ttl = 120) =>
+        _events.WithHooks(
+            new DnsTxtCreateBeforeEvent
+            {
+                ZoneId = TrimZoneId(NormalizeZoneName(zoneId)),
+                Name = name,
+            },
+            (_, err) => new DnsTxtCreateAfterEvent
+            {
+                ZoneId = TrimZoneId(NormalizeZoneName(zoneId)),
+                Name = name,
+                Error = err,
+            },
+            () => CreateTxtRecordCore(zoneId, name, content, ttl));
+
+    private Dictionary<string, object> CreateTxtRecordCore(string zoneId, string name, string content, int ttl = 120)
     {
         var zone = NormalizeZoneName(zoneId);
         var fqdn = NormalizeRecordName(name, zone);
@@ -397,7 +477,22 @@ public sealed class PowerDnsManager
         }
     }
 
-    public Dictionary<string, object> DeleteTxtRecords(string zoneId, string name, string? content = null)
+    public Dictionary<string, object> DeleteTxtRecords(string zoneId, string name, string? content = null) =>
+        _events.WithHooks(
+            new DnsTxtDeleteBeforeEvent
+            {
+                ZoneId = TrimZoneId(NormalizeZoneName(zoneId)),
+                Name = name,
+            },
+            (_, err) => new DnsTxtDeleteAfterEvent
+            {
+                ZoneId = TrimZoneId(NormalizeZoneName(zoneId)),
+                Name = name,
+                Error = err,
+            },
+            () => DeleteTxtRecordsCore(zoneId, name, content));
+
+    private Dictionary<string, object> DeleteTxtRecordsCore(string zoneId, string name, string? content = null)
     {
         var zone = NormalizeZoneName(zoneId);
         var fqdn = NormalizeRecordName(name, zone);

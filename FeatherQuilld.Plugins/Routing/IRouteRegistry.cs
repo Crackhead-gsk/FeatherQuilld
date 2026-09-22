@@ -1,4 +1,5 @@
 using FeatherQuilld.Plugins.Events;
+using FeatherQuilld.Plugins.Metadata;
 using Microsoft.AspNetCore.Http;
 
 namespace FeatherQuilld.Plugins.Routing;
@@ -40,4 +41,35 @@ public sealed class RouteDescriptor
     public string? Name { get; set; }
     public string[] Tags { get; set; } = [];
     public string? PluginId { get; set; }
+
+    /// <summary>Soft-unloaded plugins keep the descriptor but are skipped at dispatch.</summary>
+    public bool Disabled { get; set; }
+}
+
+/// <summary>Thrown when a plugin maps a route without the required capability.</summary>
+public sealed class PluginCapabilityException : InvalidOperationException
+{
+    public PluginCapabilityException(string pluginId, string capability, string pattern)
+        : base($"Plugin '{pluginId}' lacks capability '{capability}' required for route '{pattern}'.")
+    {
+        PluginId = pluginId;
+        Capability = capability;
+        Pattern = pattern;
+    }
+
+    public string PluginId { get; }
+    public string Capability { get; }
+    public string Pattern { get; }
+}
+
+/// <summary>Helpers for deciding which capability a route pattern requires.</summary>
+public static class RouteCapabilityRequirements
+{
+    public static string RequiredCapability(string pattern)
+    {
+        var path = pattern.StartsWith('/') ? pattern : "/" + pattern;
+        if (path.StartsWith("/api/system", StringComparison.OrdinalIgnoreCase))
+            return PluginCapabilities.RoutesSystem;
+        return PluginCapabilities.RoutesPublic;
+    }
 }

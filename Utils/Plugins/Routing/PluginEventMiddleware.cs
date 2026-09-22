@@ -33,6 +33,12 @@ public sealed class PluginEventMiddleware(RequestDelegate next, EventBus eventBu
         }
 
         var path = context.Request.Path.Value ?? "/";
+        if (routes.IsDisabledRoute(context.Request.Method, path))
+        {
+            context.Response.StatusCode = StatusCodes.Status404NotFound;
+            return;
+        }
+
         var executing = new RouteExecutingEvent
         {
             RoutePattern = path,

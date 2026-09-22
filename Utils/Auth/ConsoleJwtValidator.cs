@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using FeatherQuilld.Plugins.Events;
 using FeatherQuilld.Utils.WebSpaces;
 using AppConfig = FeatherQuilld.Utils.Config.Config;
 
@@ -11,19 +12,50 @@ namespace FeatherQuilld.Utils.Auth;
 /// </summary>
 public sealed class ConsoleJwtValidator
 {
+    private const string Scheme = "console-jwt";
+
     private readonly AppConfig _config;
     private readonly WebSpaceUserAccessService? _access;
+    private readonly IEventBus _events;
 
-    public ConsoleJwtValidator(AppConfig config, WebSpaceUserAccessService? access = null)
+    public ConsoleJwtValidator(
+        AppConfig config,
+        WebSpaceUserAccessService? access = null,
+        IEventBus? events = null)
     {
         _config = config;
         _access = access;
+        _events = events.OrNoOp();
     }
 
     public bool TryValidate(string token, Guid expectedSub, out string? error) =>
         TryValidate(token, expectedSub, out error, out _);
 
     public bool TryValidate(
+        string token,
+        Guid expectedSub,
+        out string? error,
+        out IReadOnlyList<string> permissions)
+    {
+        string? localError = null;
+        IReadOnlyList<string> localPerms = Array.Empty<string>();
+        var subject = expectedSub.ToString("D");
+        var valid = _events.WithHooks(
+            new AuthValidateBeforeEvent { Scheme = Scheme, Subject = subject },
+            (ok, err) => new AuthValidateAfterEvent
+            {
+                Scheme = Scheme,
+                Subject = subject,
+                Valid = ok,
+                Error = err,
+            },
+            () => TryValidateCore(token, expectedSub, out localError, out localPerms));
+        error = localError;
+        permissions = localPerms;
+        return valid;
+    }
+
+    private bool TryValidateCore(
         string token,
         Guid expectedSub,
         out string? error,

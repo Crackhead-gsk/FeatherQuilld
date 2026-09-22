@@ -1,5 +1,6 @@
 using AppConfig = FeatherQuilld.Utils.Config.Config;
 using AppLogger = FeatherQuilld.Utils.Logger.Logger;
+using FeatherQuilld.Plugins.Events;
 using FeatherQuilld.Utils.Logger;
 using FeatherQuilld.Utils.Remote;
 
@@ -16,14 +17,21 @@ public sealed class PanelSyncService : BackgroundService
     private readonly DaemonState _state;
     private readonly IPanelClient _panelClient;
     private readonly AppLogger? _logger;
+    private readonly IEventBus _events;
     private readonly SemaphoreSlim _syncLock = new(1, 1);
 
-    public PanelSyncService(AppConfig config, DaemonState state, IPanelClient panelClient, AppLogger? logger = null)
+    public PanelSyncService(
+        AppConfig config,
+        DaemonState state,
+        IPanelClient panelClient,
+        AppLogger? logger = null,
+        IEventBus? events = null)
     {
         _config = config;
         _state = state;
         _panelClient = panelClient;
         _logger = logger;
+        _events = events.OrNoOp();
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -57,8 +65,16 @@ public sealed class PanelSyncService : BackgroundService
 
         try
         {
-            await SyncHealthAsync(cancellationToken);
-            await SyncConfigAsync(cancellationToken);
+            var startedAt = DateTimeOffset.UtcNow;
+            await _events.WithHooksAsync(
+                new PanelSyncBeforeEvent { StartedAt = startedAt },
+                err => new PanelSyncAfterEvent { StartedAt = startedAt, Error = err },
+                async ct =>
+                {
+                    await SyncHealthAsync(ct);
+                    await SyncConfigAsync(ct);
+                },
+                cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

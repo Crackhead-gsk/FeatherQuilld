@@ -1,3 +1,4 @@
+using FeatherQuilld.Plugins.Events;
 using FeatherQuilld.Utils.Mail;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -12,11 +13,15 @@ namespace FeatherQuilld.Controllers;
 [Produces("application/json")]
 public sealed class MailController : ControllerBase
 {
-    private static MailManager RequireManager(AppConfig config)
+    private readonly IEventBus _events;
+
+    public MailController(IEventBus? events = null) => _events = events.OrNoOp();
+
+    private MailManager RequireManager(AppConfig config)
     {
         if (!MailProbe.ContainerRunning(config))
             throw new InvalidOperationException("Mail server is not running on this node.");
-        return new MailManager(config);
+        return new MailManager(config, _events);
     }
 
     [HttpGet("probe")]
@@ -26,7 +31,7 @@ public sealed class MailController : ControllerBase
         {
             if (MailProbe.ContainerRunning(config))
             {
-                var mgr = new MailManager(config);
+                var mgr = new MailManager(config, _events);
                 return Ok(mgr.ProbeStatus());
             }
         }
@@ -128,7 +133,7 @@ public sealed class MailController : ControllerBase
             {
                 try
                 {
-                    var mgr = new MailManager(config);
+                    var mgr = new MailManager(config, _events);
                     mgr.EnsureDkim(domain);
                 }
                 catch

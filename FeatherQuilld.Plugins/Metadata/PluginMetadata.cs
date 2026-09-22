@@ -11,4 +11,11 @@ public sealed class PluginMetadata
 
     /// <summary>Minimum FeatherQuilld host version required (semver).</summary>
     public string? MinHostVersion { get; init; }
+
+    /// <summary>Declared capabilities (see <see cref="PluginCapabilities"/>).</summary>
+    public IReadOnlyList<string> Capabilities { get; init; } = [];
+
+    /// <summary>Default settings from code; overridden by <c>plugin.yml</c> then host config.</summary>
+    public IReadOnlyDictionary<string, object?> Settings { get; init; } =
+        new Dictionary<string, object?>();
 }

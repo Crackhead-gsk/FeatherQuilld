@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using FeatherQuilld.Plugins.Events;
 using AppConfig = FeatherQuilld.Utils.Config.Config;
 
 namespace FeatherQuilld.Utils.Mail;
@@ -8,10 +9,12 @@ namespace FeatherQuilld.Utils.Mail;
 public sealed class MailManager
 {
     private readonly AppConfig _config;
+    private readonly IEventBus _events;
 
-    public MailManager(AppConfig config)
+    public MailManager(AppConfig config, IEventBus? events = null)
     {
         _config = config;
+        _events = events.OrNoOp();
         if (!MailProbe.ContainerRunning(config))
             throw new InvalidOperationException("Mail server container is not running.");
     }
@@ -48,19 +51,40 @@ public sealed class MailManager
     public void AddDomain(string domain)
     {
         domain = NormalizeDomain(domain);
-        RunSetup("domain", "add", domain);
-        PersistDomain(domain, add: true);
-        EnsureDkim(domain);
+        _events.WithHooks(
+            new MailDomainAddBeforeEvent { Domain = domain },
+            err => new MailDomainAddAfterEvent { Domain = domain, Error = err },
+            () =>
+            {
+                RunSetup("domain", "add", domain);
+                PersistDomain(domain, add: true);
+                EnsureDkim(domain);
+            });
     }
 
     public void RemoveDomain(string domain)
     {
         domain = NormalizeDomain(domain);
-        RunSetup("domain", "del", domain);
-        PersistDomain(domain, add: false);
+        _events.WithHooks(
+            new MailDomainRemoveBeforeEvent { Domain = domain },
+            err => new MailDomainRemoveAfterEvent { Domain = domain, Error = err },
+            () =>
+            {
+                RunSetup("domain", "del", domain);
+                PersistDomain(domain, add: false);
+            });
     }
 
     public object Provision(IReadOnlyDictionary<string, object?> payload)
+    {
+        var email = ResolveProvisionEmail(payload);
+        return _events.WithHooks(
+            new MailProvisionBeforeEvent { Email = email },
+            (_, err) => new MailProvisionAfterEvent { Email = email, Error = err },
+            () => ProvisionCore(payload));
+    }
+
+    private object ProvisionCore(IReadOnlyDictionary<string, object?> payload)
     {
         var action = GetString(payload, "action")?.ToLowerInvariant() ?? "";
         return action switch
@@ -180,8 +204,14 @@ public sealed class MailManager
     {
         var email = RequireEmail(payload);
         var enabled = GetBool(payload, "enabled") ?? true;
-        MailSpamHelper.SetSpamFilterEnabled(_config, email, enabled);
-        return new { ok = true, email, enabled };
+        return _events.WithHooks(
+            new MailSpamFilterBeforeEvent { Email = email, Enabled = enabled },
+            (_, err) => new MailSpamFilterAfterEvent { Email = email, Error = err },
+            () =>
+            {
+                MailSpamHelper.SetSpamFilterEnabled(_config, email, enabled);
+                return new { ok = true, email, enabled };
+            });
     }
 
     public IReadOnlyList<object> ListMailingLists(string? domain = null) =>
@@ -322,6 +352,12 @@ public sealed class MailManager
                 : combined);
         }
     }
+
+    private static string ResolveProvisionEmail(IReadOnlyDictionary<string, object?> payload) =>
+        (GetString(payload, "email")
+         ?? GetString(payload, "source")
+         ?? GetString(payload, "address")
+         ?? "").Trim().ToLowerInvariant();
 
     private static string RequireEmail(IReadOnlyDictionary<string, object?> payload)
     {

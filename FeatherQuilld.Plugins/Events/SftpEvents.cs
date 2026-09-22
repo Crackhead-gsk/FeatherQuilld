@@ -121,3 +121,59 @@ public sealed class SftpSetstatAfterEvent
     public Exception? Error { get; init; }
     public bool Success => Error is null;
 }
+
+public sealed class SftpOpenBeforeEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+    public required string Path { get; init; }
+}
+
+public sealed class SftpOpenAfterEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+    public required string Path { get; init; }
+    public Exception? Error { get; init; }
+    public bool Success => Error is null;
+}
+
+public sealed class SftpReadBeforeEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+    public required string Path { get; init; }
+}
+
+public sealed class SftpReadAfterEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+    public required string Path { get; init; }
+    public Exception? Error { get; init; }
+    public bool Success => Error is null;
+}
+
+public sealed class SftpReaddirBeforeEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+    public required string Path { get; init; }
+}
+
+public sealed class SftpReaddirAfterEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+    public required string Path { get; init; }
+    public Exception? Error { get; init; }
+    public bool Success => Error is null;
+}
+
+public sealed class SftpStatBeforeEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+    public required string Path { get; init; }
+}
+
+public sealed class SftpStatAfterEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+    public required string Path { get; init; }
+    public Exception? Error { get; init; }
+    public bool Success => Error is null;
+}

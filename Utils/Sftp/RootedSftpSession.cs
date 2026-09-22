@@ -299,19 +299,35 @@ public sealed class RootedSftpSession : IDisposable
         var r = new PacketReader(payload);
         var id = r.ReadUInt32();
         var path = r.ReadString();
-        if (!TryMapPath(path, out var full, out _))
+        if (!TryMapPath(path, out var full, out var virt))
         {
             SendStatus(id, FxNoSuchFile, "invalid path");
             return;
         }
 
-        if (!Exists(full, followLinks))
+        var found = false;
+        FileAttrs? attrs = null;
+        if (!EmitMutatingBefore(
+                new SftpStatBeforeEvent { WebSpaceUuid = _webSpaceUuid, Path = virt },
+                err => new SftpStatAfterEvent { WebSpaceUuid = _webSpaceUuid, Path = virt, Error = err },
+                () =>
+                {
+                    found = Exists(full, followLinks);
+                    if (found)
+                        attrs = AttrsFromPath(full, followLinks);
+                }))
+        {
+            SendStatus(id, FxPermissionDenied, "cancelled by plugin");
+            return;
+        }
+
+        if (!found || attrs is null)
         {
             SendStatus(id, FxNoSuchFile, "no such file");
             return;
         }
 
-        SendAttrs(id, AttrsFromPath(full, followLinks));
+        SendAttrs(id, attrs.Value);
     }
 
     private void HandleFstat(byte[] payload)
@@ -333,7 +349,7 @@ public sealed class RootedSftpSession : IDisposable
         var r = new PacketReader(payload);
         var id = r.ReadUInt32();
         var path = r.ReadString();
-        if (!TryMapPath(path, out var full, out _))
+        if (!TryMapPath(path, out var full, out var virt))
         {
             SendStatus(id, FxNoSuchFile, "invalid path");
             return;
@@ -345,14 +361,24 @@ public sealed class RootedSftpSession : IDisposable
             return;
         }
 
-        string[] entries;
+        string[]? entries = null;
         try
         {
-            var children = Directory.GetFileSystemEntries(full);
-            entries = new string[children.Length + 2];
-            entries[0] = full; // "."
-            entries[1] = Directory.GetParent(full)?.FullName ?? full; // ".."
-            Array.Copy(children, 0, entries, 2, children.Length);
+            if (!EmitMutatingBefore(
+                    new SftpReaddirBeforeEvent { WebSpaceUuid = _webSpaceUuid, Path = virt },
+                    err => new SftpReaddirAfterEvent { WebSpaceUuid = _webSpaceUuid, Path = virt, Error = err },
+                    () =>
+                    {
+                        var children = Directory.GetFileSystemEntries(full);
+                        entries = new string[children.Length + 2];
+                        entries[0] = full; // "."
+                        entries[1] = Directory.GetParent(full)?.FullName ?? full; // ".."
+                        Array.Copy(children, 0, entries, 2, children.Length);
+                    }))
+            {
+                SendStatus(id, FxPermissionDenied, "cancelled by plugin");
+                return;
+            }
         }
         catch (UnauthorizedAccessException)
         {
@@ -360,6 +386,12 @@ public sealed class RootedSftpSession : IDisposable
             return;
         }
         catch
+        {
+            SendStatus(id, FxFailure, "readdir failed");
+            return;
+        }
+
+        if (entries is null)
         {
             SendStatus(id, FxFailure, "readdir failed");
             return;
@@ -450,7 +482,7 @@ public sealed class RootedSftpSession : IDisposable
             return;
         }
 
-        if (!TryMapPath(path, out var full, out _))
+        if (!TryMapPath(path, out var full, out var virt))
         {
             SendStatus(id, FxNoSuchFile, "invalid path");
             return;
@@ -458,39 +490,56 @@ public sealed class RootedSftpSession : IDisposable
 
         try
         {
-            FileMode mode;
-            FileAccess access;
+            FileStream? stream = null;
+            if (!EmitMutatingBefore(
+                    new SftpOpenBeforeEvent { WebSpaceUuid = _webSpaceUuid, Path = virt },
+                    err => new SftpOpenAfterEvent { WebSpaceUuid = _webSpaceUuid, Path = virt, Error = err },
+                    () =>
+                    {
+                        FileMode mode;
+                        FileAccess access;
 
-            var read = (pflags & FxfRead) != 0;
-            var write = (pflags & FxfWrite) != 0 || (pflags & FxfAppend) != 0;
-            if (read && write)
-                access = FileAccess.ReadWrite;
-            else if (write)
-                access = FileAccess.Write;
-            else
-                access = FileAccess.Read;
+                        var read = (pflags & FxfRead) != 0;
+                        var write = (pflags & FxfWrite) != 0 || (pflags & FxfAppend) != 0;
+                        if (read && write)
+                            access = FileAccess.ReadWrite;
+                        else if (write)
+                            access = FileAccess.Write;
+                        else
+                            access = FileAccess.Read;
 
-            if ((pflags & FxfCreat) != 0)
+                        if ((pflags & FxfCreat) != 0)
+                        {
+                            if ((pflags & FxfExcl) != 0)
+                                mode = FileMode.CreateNew;
+                            else if ((pflags & FxfTrunc) != 0)
+                                mode = FileMode.Create;
+                            else
+                                mode = FileMode.OpenOrCreate;
+                        }
+                        else if ((pflags & FxfTrunc) != 0)
+                        {
+                            mode = FileMode.Truncate;
+                        }
+                        else
+                        {
+                            mode = FileMode.Open;
+                        }
+
+                        stream = new FileStream(full, mode, access, FileShare.ReadWrite);
+                        if ((pflags & FxfAppend) != 0)
+                            stream.Seek(0, SeekOrigin.End);
+                    }))
             {
-                if ((pflags & FxfExcl) != 0)
-                    mode = FileMode.CreateNew;
-                else if ((pflags & FxfTrunc) != 0)
-                    mode = FileMode.Create;
-                else
-                    mode = FileMode.OpenOrCreate;
-            }
-            else if ((pflags & FxfTrunc) != 0)
-            {
-                mode = FileMode.Truncate;
-            }
-            else
-            {
-                mode = FileMode.Open;
+                SendStatus(id, FxPermissionDenied, "cancelled by plugin");
+                return;
             }
 
-            var stream = new FileStream(full, mode, access, FileShare.ReadWrite);
-            if ((pflags & FxfAppend) != 0)
-                stream.Seek(0, SeekOrigin.End);
+            if (stream is null)
+            {
+                SendStatus(id, FxFailure, "open failed");
+                return;
+            }
 
             var handle = NextHandle();
             _handles[handle] = OpenHandle.ForFile(full, stream);
@@ -533,19 +582,30 @@ public sealed class RootedSftpSession : IDisposable
             return;
         }
 
+        var virt = RootedPath.ToVirtual(_root, h.Path);
         try
         {
-            if (offset >= (ulong)h.Stream.Length)
+            byte[]? buf = null;
+            var n = 0;
+            if (!EmitMutatingBefore(
+                    new SftpReadBeforeEvent { WebSpaceUuid = _webSpaceUuid, Path = virt },
+                    err => new SftpReadAfterEvent { WebSpaceUuid = _webSpaceUuid, Path = virt, Error = err },
+                    () =>
+                    {
+                        if (offset >= (ulong)h.Stream.Length)
+                            return;
+
+                        var toRead = (int)Math.Min(len, 256 * 1024);
+                        buf = new byte[toRead];
+                        h.Stream.Seek((long)offset, SeekOrigin.Begin);
+                        n = h.Stream.Read(buf, 0, toRead);
+                    }))
             {
-                SendStatus(id, FxEof, "EOF");
+                SendStatus(id, FxPermissionDenied, "cancelled by plugin");
                 return;
             }
 
-            var toRead = (int)Math.Min(len, 256 * 1024);
-            var buf = new byte[toRead];
-            h.Stream.Seek((long)offset, SeekOrigin.Begin);
-            var n = h.Stream.Read(buf, 0, toRead);
-            if (n <= 0)
+            if (buf is null || n <= 0)
             {
                 SendStatus(id, FxEof, "EOF");
                 return;

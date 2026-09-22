@@ -79,8 +79,17 @@ public sealed class SystemController : ApiControllerBase
         var healthEvent = new HealthCheckEvent { Context = HttpContext };
         var hook = _events.Emit(healthEvent);
 
-        if (hook.IsCancelled && healthEvent.Response is DaemonHealthResponse cancelled)
-            return _state.IsHealthy ? Ok(cancelled) : StatusCode(503, cancelled);
+        if (hook.IsCancelled)
+        {
+            if (healthEvent.Response is DaemonHealthResponse cancelled)
+                return StatusCode(StatusCodes.Status503ServiceUnavailable, cancelled);
+
+            return StatusCode(StatusCodes.Status503ServiceUnavailable, new
+            {
+                error = "cancelled",
+                message = "Health check cancelled by plugin hook.",
+            });
+        }
 
         if (hook.IsReplaced && hook.Replacement is DaemonHealthResponse replaced)
             return _state.IsHealthy ? Ok(replaced) : StatusCode(503, replaced);
@@ -202,10 +211,27 @@ public sealed class SystemController : ApiControllerBase
     public ActionResult<IReadOnlyList<PluginInfoResponse>> Plugins(
         [FromServices] Utils.Plugins.PluginManager pluginManager) =>
         Ok(pluginManager.Plugins.Select(p => new PluginInfoResponse(
-            p.Instance.Metadata.Id,
-            p.Instance.Metadata.Name,
-            p.Instance.Metadata.Version,
-            p.Instance.Metadata.Description)).ToList());
+            p.EffectiveMetadata.Id,
+            p.EffectiveMetadata.Name,
+            p.EffectiveMetadata.Version,
+            p.EffectiveMetadata.Description,
+            p.EffectiveMetadata.Capabilities)).ToList());
+
+    /// <summary>
+    /// Soft-unload a plugin (subscriptions + routes). MVC application parts require a process restart.
+    /// </summary>
+    [HttpDelete("plugins/{pluginId}")]
+    [Authorize]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> UnloadPlugin(
+        string pluginId,
+        [FromServices] Utils.Plugins.PluginManager pluginManager,
+        CancellationToken cancellationToken)
+    {
+        var unloaded = await pluginManager.UnloadAsync(pluginId, cancellationToken).ConfigureAwait(false);
+        return unloaded ? NoContent() : NotFound(new { error = "plugin_not_found", plugin_id = pluginId });
+    }
 
     /// <summary>Live package install/remove output (bearer via Authorization header or <c>?token=</c>).</summary>
     [Authorize]
@@ -539,7 +565,8 @@ public sealed record PluginInfoResponse(
     string Id,
     string Name,
     string Version,
-    string? Description);
+    string? Description,
+    IReadOnlyList<string> Capabilities);
 
 public sealed record SystemLogsListResponse(
     [property: JsonPropertyName("directory")] string Directory,

@@ -178,3 +178,36 @@ public sealed class FilePullAfterEvent
     public Exception? Error { get; init; }
     public bool Success => Error is null;
 }
+
+public sealed class FileSymlinkBeforeEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+    public required string Link { get; init; }
+    public required string Target { get; init; }
+}
+
+public sealed class FileSymlinkAfterEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+    public required string Link { get; init; }
+    public required string Target { get; init; }
+    public Exception? Error { get; init; }
+    public bool Success => Error is null;
+}
+
+public sealed class FileDownloadArchiveBeforeEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+    public required string Directory { get; init; }
+    public string? Format { get; init; }
+}
+
+public sealed class FileDownloadArchiveAfterEvent
+{
+    public required Guid WebSpaceUuid { get; init; }
+    public required string Directory { get; init; }
+    public string? Format { get; init; }
+    public string? ArchivePath { get; init; }
+    public Exception? Error { get; init; }
+    public bool Success => Error is null;
+}

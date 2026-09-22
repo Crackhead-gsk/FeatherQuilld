@@ -304,7 +304,19 @@ public sealed class WebSpaceFileService
     /// Create a symlink at <paramref name="link"/> pointing at <paramref name="target"/>
     /// (both confined under the WebSpace root).
     /// </summary>
-    public void CreateSymlink(Guid uuid, string link, string target)
+    public void CreateSymlink(Guid uuid, string link, string target) =>
+        _events.WithHooks(
+            new FileSymlinkBeforeEvent { WebSpaceUuid = uuid, Link = link, Target = target },
+            err => new FileSymlinkAfterEvent
+            {
+                WebSpaceUuid = uuid,
+                Link = link,
+                Target = target,
+                Error = err,
+            },
+            () => CreateSymlinkCore(uuid, link, target));
+
+    private void CreateSymlinkCore(Guid uuid, string link, string target)
     {
         if (string.IsNullOrWhiteSpace(link))
             throw new ArgumentException("link is required.");
@@ -746,7 +758,25 @@ public sealed class WebSpaceFileService
     }
 
     /// <summary>Compress a directory to a temp tar.gz and return the file path (caller deletes).</summary>
-    public string CreateDirectoryDownloadArchive(Guid uuid, string directory, string format = "tar.gz")
+    public string CreateDirectoryDownloadArchive(Guid uuid, string directory, string format = "tar.gz") =>
+        _events.WithHooks(
+            new FileDownloadArchiveBeforeEvent
+            {
+                WebSpaceUuid = uuid,
+                Directory = directory,
+                Format = format,
+            },
+            (archivePath, err) => new FileDownloadArchiveAfterEvent
+            {
+                WebSpaceUuid = uuid,
+                Directory = directory,
+                Format = format,
+                ArchivePath = archivePath,
+                Error = err,
+            },
+            () => CreateDirectoryDownloadArchiveCore(uuid, directory, format));
+
+    private string CreateDirectoryDownloadArchiveCore(Guid uuid, string directory, string format = "tar.gz")
     {
         var root = RequireRoot(uuid);
         var dirVirtual = string.IsNullOrWhiteSpace(directory) ? "/" : directory;

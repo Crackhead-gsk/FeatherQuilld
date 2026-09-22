@@ -14,4 +14,10 @@ public sealed class PluginManifest
     public string? Main { get; set; }
 
     public bool Enabled { get; set; } = true;
+
+    /// <summary>Declared capabilities (see <see cref="FeatherQuilld.Plugins.Metadata.PluginCapabilities"/>).</summary>
+    public List<string> Capabilities { get; set; } = [];
+
+    /// <summary>Default settings; overridden by host <c>plugins.settings.&lt;id&gt;</c>.</summary>
+    public Dictionary<string, object?> Settings { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }

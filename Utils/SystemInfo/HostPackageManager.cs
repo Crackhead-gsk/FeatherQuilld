@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using FeatherQuilld.Plugins.Events;
 using FeatherQuilld.Utils.Dns;
 using FeatherQuilld.Utils.Proxy;
 using FeatherQuilld.Utils.Startup;
@@ -24,12 +25,17 @@ public sealed class HostPackageManager
     private static readonly Regex AnsiRegex = new(@"\x1b\[[0-9;]*[A-Za-z]", RegexOptions.Compiled);
     private readonly SystemPackageWsHub? _wsHub;
     private readonly AppConfig? _config;
+    private readonly IEventBus _events;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _operationLocks = new();
 
-    public HostPackageManager(SystemPackageWsHub? wsHub = null, AppConfig? config = null)
+    public HostPackageManager(
+        SystemPackageWsHub? wsHub = null,
+        AppConfig? config = null,
+        IEventBus? events = null)
     {
         _wsHub = wsHub;
         _config = config;
+        _events = events.OrNoOp();
     }
 
     static HostPackageManager()
@@ -100,32 +106,36 @@ public sealed class HostPackageManager
         var id = NormalizeId(packageId);
         logger?.Info(LoggerTypes.Application, $"Installing host package: {id}");
 
-        return await RunExclusiveAsync(id, "install", async innerCt =>
-        {
-            if (IsReverseProxy(id))
+        return await _events.WithHooksAsync(
+            new PackageInstallBeforeEvent { PackageId = id },
+            (result, err) => new PackageInstallAfterEvent { PackageId = id, Error = err },
+            async innerOuterCt => await RunExclusiveAsync(id, "install", async innerCt =>
             {
-                var conflict = GetInstalledReverseProxyExcept(id);
-                if (conflict is not null)
+                if (IsReverseProxy(id))
                 {
-                    return HostPackageOperationResult.Fail(
-                        $"Remove {conflict} before installing {id}. Only one reverse proxy may be installed.");
+                    var conflict = GetInstalledReverseProxyExcept(id);
+                    if (conflict is not null)
+                    {
+                        return HostPackageOperationResult.Fail(
+                            $"Remove {conflict} before installing {id}. Only one reverse proxy may be installed.");
+                    }
                 }
-            }
 
-            return id switch
-            {
-                "caddy" => await InstallCaddyAsync(id, logger, innerCt).ConfigureAwait(false),
-                "nginx" => await InstallNginxAsync(id, logger, innerCt).ConfigureAwait(false),
-                "traefik" => await InstallTraefikAsync(id, logger, innerCt).ConfigureAwait(false),
-                "docker" => await InstallDockerAsync(id, logger, innerCt).ConfigureAwait(false),
-                "powerdns" => await InstallPowerDnsAsync(id, logger, innerCt).ConfigureAwait(false),
-                "clamav" => await InstallClamAvAsync(id, logger, innerCt).ConfigureAwait(false),
-                "modsecurity" => await InstallModSecurityAsync(id, logger, innerCt).ConfigureAwait(false),
-                "mailserver" => await InstallMailServerAsync(id, logger, innerCt).ConfigureAwait(false),
-                "webmail" => await InstallWebmailAsync(id, logger, innerCt).ConfigureAwait(false),
-                _ => HostPackageOperationResult.Fail($"Unknown package: {packageId}"),
-            };
-        }, logger, ct).ConfigureAwait(false);
+                return id switch
+                {
+                    "caddy" => await InstallCaddyAsync(id, logger, innerCt).ConfigureAwait(false),
+                    "nginx" => await InstallNginxAsync(id, logger, innerCt).ConfigureAwait(false),
+                    "traefik" => await InstallTraefikAsync(id, logger, innerCt).ConfigureAwait(false),
+                    "docker" => await InstallDockerAsync(id, logger, innerCt).ConfigureAwait(false),
+                    "powerdns" => await InstallPowerDnsAsync(id, logger, innerCt).ConfigureAwait(false),
+                    "clamav" => await InstallClamAvAsync(id, logger, innerCt).ConfigureAwait(false),
+                    "modsecurity" => await InstallModSecurityAsync(id, logger, innerCt).ConfigureAwait(false),
+                    "mailserver" => await InstallMailServerAsync(id, logger, innerCt).ConfigureAwait(false),
+                    "webmail" => await InstallWebmailAsync(id, logger, innerCt).ConfigureAwait(false),
+                    _ => HostPackageOperationResult.Fail($"Unknown package: {packageId}"),
+                };
+            }, logger, innerOuterCt).ConfigureAwait(false),
+            ct).ConfigureAwait(false);
     }
 
     public async Task<HostPackageOperationResult> RemoveAsync(
@@ -137,22 +147,26 @@ public sealed class HostPackageManager
         var id = NormalizeId(packageId);
         logger?.Info(LoggerTypes.Application, $"Removing host package: {id}");
 
-        return await RunExclusiveAsync(id, "remove", async innerCt =>
-        {
-            return id switch
+        return await _events.WithHooksAsync(
+            new PackageRemoveBeforeEvent { PackageId = id },
+            (result, err) => new PackageRemoveAfterEvent { PackageId = id, Error = err },
+            async innerOuterCt => await RunExclusiveAsync(id, "remove", async innerCt =>
             {
-                "caddy" => await RemoveCaddyAsync(id, purgeConfig, logger, innerCt).ConfigureAwait(false),
-                "nginx" => await RemoveViaPackageManagerAsync(id, "nginx", purgeConfig, logger, innerCt).ConfigureAwait(false),
-                "traefik" => await RemoveTraefikAsync(id, purgeConfig, logger, innerCt).ConfigureAwait(false),
-                "docker" => await RemoveViaPackageManagerAsync(id, ResolveDockerPackageName(), purgeConfig, logger, innerCt).ConfigureAwait(false),
-                "powerdns" => await RemovePowerDnsAsync(id, purgeConfig, logger, innerCt).ConfigureAwait(false),
-                "clamav" => await RemoveViaPackageManagerAsync(id, "clamav clamav-daemon", purgeConfig, logger, innerCt).ConfigureAwait(false),
-                "modsecurity" => await RemoveModSecurityAsync(id, purgeConfig, logger, innerCt).ConfigureAwait(false),
-                "mailserver" => await RemoveMailServerAsync(id, purgeConfig, logger, innerCt).ConfigureAwait(false),
-                "webmail" => await RemoveWebmailAsync(id, purgeConfig, logger, innerCt).ConfigureAwait(false),
-                _ => HostPackageOperationResult.Fail($"Unknown package: {packageId}"),
-            };
-        }, logger, ct).ConfigureAwait(false);
+                return id switch
+                {
+                    "caddy" => await RemoveCaddyAsync(id, purgeConfig, logger, innerCt).ConfigureAwait(false),
+                    "nginx" => await RemoveViaPackageManagerAsync(id, "nginx", purgeConfig, logger, innerCt).ConfigureAwait(false),
+                    "traefik" => await RemoveTraefikAsync(id, purgeConfig, logger, innerCt).ConfigureAwait(false),
+                    "docker" => await RemoveViaPackageManagerAsync(id, ResolveDockerPackageName(), purgeConfig, logger, innerCt).ConfigureAwait(false),
+                    "powerdns" => await RemovePowerDnsAsync(id, purgeConfig, logger, innerCt).ConfigureAwait(false),
+                    "clamav" => await RemoveViaPackageManagerAsync(id, "clamav clamav-daemon", purgeConfig, logger, innerCt).ConfigureAwait(false),
+                    "modsecurity" => await RemoveModSecurityAsync(id, purgeConfig, logger, innerCt).ConfigureAwait(false),
+                    "mailserver" => await RemoveMailServerAsync(id, purgeConfig, logger, innerCt).ConfigureAwait(false),
+                    "webmail" => await RemoveWebmailAsync(id, purgeConfig, logger, innerCt).ConfigureAwait(false),
+                    _ => HostPackageOperationResult.Fail($"Unknown package: {packageId}"),
+                };
+            }, logger, innerOuterCt).ConfigureAwait(false),
+            ct).ConfigureAwait(false);
     }
 
     private async Task<HostPackageOperationResult> RunExclusiveAsync(

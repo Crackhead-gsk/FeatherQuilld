@@ -1,3 +1,4 @@
+using FeatherQuilld.Plugins.Events;
 using FeatherQuilld.Utils.Dns;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -12,11 +13,15 @@ namespace FeatherQuilld.Controllers;
 [Produces("application/json")]
 public sealed class DnsController : ControllerBase
 {
-    private static PowerDnsManager RequireManager(AppConfig config)
+    private readonly IEventBus _events;
+
+    public DnsController(IEventBus? events = null) => _events = events.OrNoOp();
+
+    private PowerDnsManager RequireManager(AppConfig config)
     {
         if (!PowerDnsProbe.IsAvailable(config))
             throw new InvalidOperationException("PowerDNS is not available on this node.");
-        return new PowerDnsManager(config);
+        return new PowerDnsManager(config, _events);
     }
 
     [HttpGet("probe")]
@@ -24,7 +29,7 @@ public sealed class DnsController : ControllerBase
     {
         try
         {
-            var mgr = new PowerDnsManager(config);
+            var mgr = new PowerDnsManager(config, _events);
             return Ok(mgr.ProbeStatus());
         }
         catch

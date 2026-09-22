@@ -30,7 +30,8 @@ public static class FtpServiceCollectionExtensions
                 sp.GetRequiredService<FtpConfig>(),
                 sp.GetRequiredService<WebSpaceStore>(),
                 sp.GetRequiredService<IPanelClient>(),
-                logger));
+                logger,
+                sp.GetService<FeatherQuilld.Plugins.Events.IEventBus>()));
         services.AddSingleton<IAccountDirectoryQuery, PanelFtpAccountDirectoryQuery>();
         services.AddSingleton<IFileSystemClassFactory, PanelFtpFileSystemFactory>();
 
