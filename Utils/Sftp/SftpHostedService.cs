@@ -36,6 +36,33 @@ public sealed class SftpHostedService : IHostedService, IDisposable
     private readonly IEventBus _events;
     private readonly ConcurrentDictionary<string, SftpAuthResult> _authBySession = new();
     private readonly ConcurrentDictionary<uint, byte> _sftpChannels = new();
+
+    // Registration handshake between the connection handler and the panel
+    // authenticator (which runs on the library's own dispatch thread): the
+    // handler completes the per-session signal once it is committed to
+    // busy-spinning for the connection layer, and the authenticator's success
+    // path WAITS for that signal before returning Success. That guarantees the
+    // spin is already running before the library constructs the connection
+    // layer and dispatches the client's pipelined channel-open + "subsystem"
+    // request, so the hook can never be attached too late (see
+    // WaitForAuthAndHookSubsystem).
+    private readonly ConcurrentDictionary<string, TaskCompletionSource> _spinningSignals = new();
+
+    // Per-connection attempt accounting for the panel's per-method auth
+    // limits (password / publickey). The library's own MaxAuthAttempts counts
+    // EVERY request (none probe, key probe, password) and must not be used
+    // for these limits.
+    private readonly SftpAuthAttemptLimiter _attemptLimiter = new();
+
+    // The post-auth subsystem hook needs a short busy-spin (see
+    // WaitForAuthAndHookSubsystem), but unbounded concurrent spinners
+    // could starve the thread pool — cap them at 2×cores, clamped to [8, 32].
+    private static readonly SemaphoreSlim SubsystemHookSpinGate = new(
+        Math.Clamp(2 * Environment.ProcessorCount, 8, 32));
+
+    private static readonly TimeSpan SubsystemHookSpinBudget = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan SpinningHandshakeBudget = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan HandshakeWaitBudget = TimeSpan.FromSeconds(10);
     private FxSshServer? _fxServer;
     private EmbeddedSshServer? _embeddedServer;
     private CancellationTokenSource? _embeddedCts;
@@ -127,7 +154,21 @@ public sealed class SftpHostedService : IHostedService, IDisposable
         {
             ServerVersion = "SSH-2.0-FeatherQuilld",
             Authenticator = new PanelSftpAuthenticator(this),
-            MaxAuthAttempts = Math.Max(1, _config.Sftp.Limits.AuthenticationPasswordAttempts),
+            // The panel's password-attempt limit (default 3) must NOT be
+            // handed to the library 1:1: the library counts EVERY auth
+            // request against MaxAuthAttempts — the "none" probe, each
+            // publickey probe, and then the password — so a limit of 3 is
+            // exhausted exactly by a successful key-first login, and the
+            // library throws right after sending USERAUTH_SUCCESS, killing
+            // the connection (FileZilla-style key-first clients failed
+            // 100% of the time). Budget for every legitimate request with
+            // headroom; the per-method limits are enforced separately in
+            // PanelSftpAuthenticator via SftpAuthAttemptLimiter, which
+            // counts only the method each limit governs.
+            MaxAuthAttempts = Math.Max(20,
+                _config.Sftp.Limits.AuthenticationPubkeyAttempts
+                + _config.Sftp.Limits.AuthenticationPasswordAttempts
+                + 4),
         };
         options.HostKeys.Add(hostKey);
 
@@ -137,7 +178,18 @@ public sealed class SftpHostedService : IHostedService, IDisposable
 
         _embeddedServer.ConnectionAccepted += connection =>
         {
-            _ = Task.Run(() => HandleEmbeddedConnectionAsync(connection, ct), ct);
+            // Dedicated background thread — NOT the thread pool. The handler must
+            // actually be running (polling the connection state) while authentication
+            // is in flight so it can attach the subsystem hook the instant the library
+            // constructs the connection layer; a thread-pool task can sit queued for the
+            // entire auth window under load, and the client's pipelined subsystem request
+            // then races past the hook ("subsystem request failed on channel 0").
+            var thread = new Thread(() => _ = HandleEmbeddedConnectionAsync(connection, ct))
+            {
+                IsBackground = true,
+                Name = "fq-sftp-ed25519-handler",
+            };
+            thread.Start();
             return Task.CompletedTask;
         };
 
@@ -157,42 +209,45 @@ public sealed class SftpHostedService : IHostedService, IDisposable
     {
         try
         {
-            // IMPORTANT: this handler is started (via Task.Run) from the ConnectionAccepted
-            // event, which SshServer raises *before* it calls connection.RunAsync(). RunAsync
-            // performs the SSH handshake and authentication and only *afterwards* constructs
-            // the connection's internal connection layer, and it starts consuming/dispatching
-            // subsequent SSH messages (channel-open, channel-request "subsystem", ...)
-            // synchronously right after, with no yield point in between. Until the connection
-            // layer exists, HookSubsystemRequests has nothing to attach to (it used to
-            // silently no-op) and AcceptChannelAsync throws InvalidOperationException
-            // immediately (it used to be swallowed by a bare `catch { break; }`). That
-            // combination — both failures were completely silent — is why SFTP died right
-            // after "auth ok" with no log line and no exception at all: "subsystem request
-            // failed on channel 0" on the client side.
+            // IMPORTANT: this handler runs on a dedicated thread, started from the
+            // ConnectionAccepted event, which SshServer raises *before* it calls
+            // connection.RunAsync(). RunAsync performs the SSH handshake and
+            // authentication and only *afterwards* constructs the connection's internal
+            // connection layer, then starts dispatching subsequent SSH messages
+            // (channel-open, channel-request "subsystem", ...) synchronously right
+            // after, with no yield point in between. Until the connection layer exists,
+            // HookSubsystemRequests has nothing to attach to, and AcceptChannelAsync
+            // throws InvalidOperationException. Both failures were completely silent —
+            // that is why SFTP used to die right after "auth ok" with no log line and no
+            // exception at all: "subsystem request failed on channel 0" on the client
+            // side.
             //
-            // We deliberately poll for the *same* private "_connectionLayer" field that
-            // HookSubsystemRequests needs (via WaitForConnectionLayerAndHook below), rather
-            // than polling the public SshConnection.Channels property (which reads a
-            // different field, _channelManager) and only then doing a second, separate
-            // reflection lookup for _connectionLayer. Both fields are assigned back-to-back
-            // with no memory barrier in between, so on relaxed/weak read orderings a second
-            // reader thread is not guaranteed to observe them becoming visible in the same
-            // order — polling Channels can flip true while _connectionLayer is still not
-            // observably non-null yet, causing a spurious "connection layer not available"
-            // failure right after the wait supposedly succeeded. Waiting on the exact field we
-            // are about to use removes that gap entirely.
+            // We deliberately wait for the *same* private "_connectionLayer" field that
+            // HookSubsystemRequests needs, rather than polling the public
+            // SshConnection.Channels property (which reads a different field,
+            // _channelManager) and only then doing a second, separate reflection lookup.
+            // Both fields are assigned back-to-back with no memory barrier in between,
+            // so on relaxed/weak read orderings a second reader thread is not guaranteed
+            // to observe them becoming visible in the same order — polling Channels can
+            // flip true while _connectionLayer is still not observably non-null yet,
+            // causing a spurious "connection layer not available" failure right after the
+            // wait supposedly succeeded. Waiting on the exact field we are about to use
+            // removes that gap entirely.
             //
-            // A real SSH/SFTP client pipelines its post-auth channel-open + "subsystem"
-            // request essentially immediately, so this must be closed with a tight,
-            // low-latency wait rather than Task.Delay-based polling (which only checks every
-            // N milliseconds and can still lose the race against a fast client). SpinWait
-            // busy-spins for the first iterations (sub-microsecond reaction time) and only
-            // backs off to Thread.Sleep once the wait drags on, so it stays cheap even for a
-            // slow panel-auth round trip while reliably winning the race against real clients.
-            if (!WaitForConnectionLayerAndHook(connection, TimeSpan.FromSeconds(10), out var hooked))
+            // The wait is structured so that CPU is only spent in the one window where it
+            // actually matters: while the connection handshakes we sleep-poll the public
+            // connection State machine (~0 CPU for scanners, which never reach the auth
+            // phase), and once the connection is entering authentication we register with
+            // the authenticator (running on the library's own dispatch thread) and
+            // busy-spin for the connection layer. The authenticator WAITS for that
+            // registration before returning Success, which makes the spin deterministically
+            // precede the layer construction/dispatch — see WaitForAuthAndHookSubsystem.
+            var (waited, hooked) = WaitForAuthAndHookSubsystem(connection, ct);
+
+            if (!waited)
             {
                 _logger?.Warning(LoggerTypes.Application,
-                    "SFTP ed25519 connection: connection layer never became ready (handshake/auth did not complete in time); closing.");
+                    "SFTP ed25519 connection: key exchange or authentication did not complete in time; closing handler.");
                 return;
             }
 
@@ -237,51 +292,178 @@ public sealed class SftpHostedService : IHostedService, IDisposable
         {
             try
             {
-                _authBySession.TryRemove("conn:" + Convert.ToHexString(connection.SessionId.ToArray()), out _);
+                var sessionKey = Convert.ToHexString(connection.SessionId.ToArray());
+                _authBySession.TryRemove("conn:" + sessionKey, out _);
+                _spinningSignals.TryRemove(sessionKey, out _);
+                _attemptLimiter.Remove(sessionKey);
             }
             catch { /* ignore */ }
         }
     }
 
     /// <summary>
-    /// Blocks (via a SpinWait, not an async delay) until the connection's private
-    /// "_connectionLayer" field becomes non-null — i.e. until <c>SshConnection.RunAsync</c>
-    /// has finished the handshake/authentication phases and constructed it — then hooks the
-    /// "sftp" subsystem channel request on it in the very same reflection round-trip, so there
-    /// is no gap between "field observed non-null" and "field read for hooking" in which a
-    /// second connection-layer swap (there isn't one today, but defensively) or a stale read
-    /// could reintroduce the race. Returns false only on timeout (field never became non-null);
-    /// <paramref name="hooked"/> reports whether the hook attach itself succeeded.
-    /// Runs on the calling (Task.Run-dispatched) thread, so blocking here does not block the
-    /// connection's own processing loop.
+    /// Waits for the connection to reach its authentication phase WITHOUT spending CPU
+    /// on peers that never get there, registers with the authenticator, then briefly
+    /// busy-spins for the connection's private "_connectionLayer" field and hooks the
+    /// "sftp" subsystem channel request on it via reflection.
+    ///
+    /// Why this shape: the library constructs the connection layer only after
+    /// authentication completes (SshConnection.RunAsync: AuthenticateAsync, then
+    /// "_connectionLayer = new ConnectionLayer(...)"), and it dispatches the client's
+    /// pipelined channel-open + "subsystem" request right after, with no yield point
+    /// in between. Whatever thread attaches the hook must therefore already be
+    /// spinning at the moment the field is assigned — being woken by any kind of
+    /// signal or continuation at that point is too late: the dispatcher can win the
+    /// wake-up race and answer the subsystem request before the hook lands
+    /// ("subsystem request failed on channel 0").
+    ///
+    /// Deterministic ordering without burning CPU on the whole handshake:
+    ///  1. Sleep-poll the connection's public State machine until it enters
+    ///     "Authenticating" (set right before the auth loop). Real clients pipeline
+    ///     version+KEXINIT+NEWKEYS and reach it within milliseconds; scanners never
+    ///     do, and sleep-polling costs them ~0 CPU.
+    ///  2. Complete the per-session registration signal. The panel authenticator —
+    ///     which runs ON the library's dispatch thread — WAITS for this signal on
+    ///     its success path before returning Success. So by the time the library
+    ///     proceeds to construct the connection layer, this method is already inside
+    ///     its busy-spin below; observation/scheduling latency is absorbed by the
+    ///     authenticator instead of being a race.
+    ///  3. Spin (bounded, concurrency-capped, priority-boosted best-effort) for the
+    ///     field, then hook it. The spin starts before the layer exists and catches
+    ///     the assignment within microseconds — before the client's channel-open can
+    ///     even arrive (it needs the USERAUTH_SUCCESS round trip first).
+    ///
+    /// Returns <c>waited=false</c> when the connection never reached authentication in
+    /// time (scanner/idle peer) — the caller should give up on it. <paramref
+    /// name="hooked"/> reports whether the hook attach itself succeeded.
     /// </summary>
-    private bool WaitForConnectionLayerAndHook(SshConnection connection, TimeSpan timeout, out bool hooked)
+    private (bool Waited, bool Hooked) WaitForAuthAndHookSubsystem(
+        SshConnection connection, CancellationToken ct)
     {
+        // Phase 1: sleep-poll until the auth phase is entered. This must stay a
+        // sleep (not a spin): a scanner that stalls before auth would otherwise
+        // burn CPU for the whole handshake budget on this dedicated thread.
+        var deadline = DateTime.UtcNow + HandshakeWaitBudget;
+        while (connection.State != ConnectionState.Authenticating
+               && connection.State != ConnectionState.Connected
+               && connection.State != ConnectionState.Disconnected)
+        {
+            if (ct.IsCancellationRequested || DateTime.UtcNow >= deadline)
+                return (false, false);
+            Thread.Sleep(1);
+        }
+
+        if (connection.State == ConnectionState.Disconnected)
+            return (false, false);
+
+        _logger?.Debug(LoggerTypes.Application,
+            $"SFTP ed25519 handler: auth phase observed (state={connection.State}) on handler thread #{Environment.CurrentManagedThreadId}");
+
         var field = typeof(SshConnection).GetField(
             "_connectionLayer", BindingFlags.Instance | BindingFlags.NonPublic);
         if (field is null)
         {
             _logger?.Warning(LoggerTypes.Application,
                 "SFTP subsystem hook failed: _connectionLayer field not found via reflection (library layout changed?).");
-            hooked = false;
-            return true; // not a timeout — no point waiting for a field that doesn't exist.
+            return (true, false);
         }
 
-        var sw = new SpinWait();
-        var deadline = DateTime.UtcNow + timeout;
-        ConnectionLayer? layer;
-        while ((layer = field.GetValue(connection) as ConnectionLayer) is null)
+        // Registration handshake: the per-session signal is completed INSIDE the
+        // spin loop below (first iteration), so it is only set once this thread is
+        // already hot and actively spinning. The authenticator's success path waits
+        // for exactly this signal (see PanelSftpAuthenticator) before returning
+        // Success — from the signal to the library's connection-layer construction
+        // are microseconds on the dispatch thread, and this handler is mid-loop the
+        // whole time, so the field read cannot miss the assignment (except by an
+        // OS preemption right in that window, which the loop's 2s budget survives).
+        var sessionKey = connection.SessionId.Length > 0
+            ? Convert.ToHexString(connection.SessionId.ToArray())
+            : "";
+
+        // Cap concurrent spinners when a slot is available. Wait(0) only — never
+        // BLOCK here: under gate saturation the spin proceeds ungated (still bounded
+        // by the spin budget). The cap is CPU protection; correctness must never
+        // queue behind it.
+        var gated = SubsystemHookSpinGate.Wait(0);
+
+        try
         {
-            if (DateTime.UtcNow >= deadline)
+            ThreadPriority? previous = null;
+            try
             {
-                hooked = false;
-                return false;
+                // Best-effort boost so this spinner wins the race against the
+                // connection's own dispatch loop; not available on every platform.
+                previous = Thread.CurrentThread.Priority;
+                Thread.CurrentThread.Priority = ThreadPriority.Highest;
             }
-            sw.SpinOnce();
-        }
+            catch
+            {
+                // ignore — priority boost is an optimization, never a requirement
+            }
 
-        hooked = HookSubsystemRequests(layer);
-        return true;
+            var spinDeadline = DateTime.UtcNow + SubsystemHookSpinBudget;
+            var registered = false;
+            ConnectionLayer? layer;
+            while ((layer = field.GetValue(connection) as ConnectionLayer) is null)
+            {
+                if (!registered)
+                {
+                    registered = true;
+                    if (sessionKey.Length > 0)
+                    {
+                        _spinningSignals.GetOrAdd(sessionKey,
+                            static _ => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously))
+                            .TrySetResult();
+                    }
+                    _logger?.Debug(LoggerTypes.Application,
+                        $"SFTP ed25519 handler: registered spinning signal session={sessionKey[..Math.Min(8, sessionKey.Length)]}… (spin running) t={DateTime.UtcNow:HH:mm:ss.fff}");
+                }
+
+                if (connection.State == ConnectionState.Disconnected
+                    || ct.IsCancellationRequested
+                    || DateTime.UtcNow >= spinDeadline)
+                {
+                    break;
+                }
+
+                // Deliberately a REAL busy-wait: Thread.SpinWait only issues PAUSE
+                // instructions, it never yields or sleeps. SpinWait.SpinOnce must NOT
+                // be used here — after a few iterations it backs off to Thread.Sleep(1),
+                // and a Sleep(1) wake is ~1 ms while the window between the library's
+                // connection-layer construction and the dispatch of the client's
+                // pipelined channel requests is tens of microseconds. A backed-off
+                // spinner wakes too late and the hook lands after the dispatch
+                // ("subsystem request failed on channel 0" — the original race).
+                Thread.SpinWait(30);
+            }
+
+            try
+            {
+                if (previous is { } p)
+                    Thread.CurrentThread.Priority = p;
+            }
+            catch
+            {
+                // ignore
+            }
+
+            if (layer is null)
+            {
+                _logger?.Warning(LoggerTypes.Application,
+                    "SFTP ed25519 connection: connection layer did not appear after auth; subsystem hook skipped.");
+                return (true, false);
+            }
+
+            var hooked = HookSubsystemRequests(layer);
+            _logger?.Debug(LoggerTypes.Application,
+                $"SFTP ed25519 handler: hook attach {(hooked ? "succeeded" : "FAILED")} after spin t={DateTime.UtcNow:HH:mm:ss.fff}");
+            return (true, hooked);
+        }
+        finally
+        {
+            if (gated)
+                SubsystemHookSpinGate.Release();
+        }
     }
 
     private bool HookSubsystemRequests(ConnectionLayer layer)
@@ -290,6 +472,9 @@ public sealed class SftpHostedService : IHostedService, IDisposable
         {
             layer.ChannelRequestReceived += (channel, request, _) =>
             {
+                _logger?.Debug(LoggerTypes.Application,
+                    $"SFTP ed25519 hook: channel request type='{request.RequestType}' recipient={request.RecipientChannel} t={DateTime.UtcNow:HH:mm:ss.fff}");
+
                 if (!string.Equals(request.RequestType, "subsystem", StringComparison.OrdinalIgnoreCase))
                     return ValueTask.FromResult(false);
 
@@ -339,15 +524,34 @@ public sealed class SftpHostedService : IHostedService, IDisposable
 
             Directory.CreateDirectory(auth.RootPath);
             await using var transport = new EmbeddedSshTransportChannel(channel);
+            var sessionEnded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            transport.Closed += (_, _) => sessionEnded.TrySetResult();
             _ = OpenSession(transport, auth, auth.User);
             _logger?.Debug(LoggerTypes.Application, $"SFTP subsystem attached root={auth.RootPath}");
 
-            while (!ct.IsCancellationRequested && !channel.IsClosed)
+            // Only now that the session has subscribed to DataReceived may the
+            // read pump start — starting it earlier would let it consume (and
+            // silently drop) the client's INIT packet, which may already be
+            // buffered on the channel, and the session would wait forever.
+            transport.Start();
+
+            // The session ends when the client closes the channel OR sends
+            // channel EOF (the transport pump raises Closed on EOF). Both must
+            // complete the close handshake below.
+            while (!ct.IsCancellationRequested && !channel.IsClosed && !sessionEnded.Task.IsCompleted)
                 await Task.Delay(250, ct).ConfigureAwait(false);
+
+            // Session ended: complete the close handshake so the client sees a
+            // clean teardown. Without this nobody ever closes the channel — the
+            // library's ReadAsync ignores EOF, so nothing reacts to the client's
+            // "bye", and one-shot (scripted) logins hang on disconnect for the
+            // client's full timeout.
+            try { await channel.CloseAsync(CancellationToken.None).ConfigureAwait(false); } catch { /* ignore */ }
         }
         catch (OperationCanceledException)
         {
-            // shutting down
+            // shutting down — still attempt the close handshake, best effort
+            try { await channel.CloseAsync(CancellationToken.None).ConfigureAwait(false); } catch { /* ignore */ }
         }
         catch (Exception ex)
         {
@@ -585,17 +789,40 @@ public sealed class SftpHostedService : IHostedService, IDisposable
                 if (string.Equals(context.Method, "none", StringComparison.OrdinalIgnoreCase))
                     return ValueTask.FromResult<(AuthResult, AuthenticatedUser?)>((AuthResult.Failure, null));
 
+                var sessionKey = context.SessionId is { Length: > 0 } id
+                    ? Convert.ToHexString(id)
+                    : "";
+
                 string authMethod;
                 string? publicKey = null;
                 var password = "";
+                var isPassword = false;
 
                 if (string.Equals(context.Method, "publickey", StringComparison.OrdinalIgnoreCase))
                 {
                     if (!context.HasSignature)
-                        return ValueTask.FromResult<(AuthResult, AuthenticatedUser?)>((AuthResult.Continue, null));
+                    {
+                        // Signature-less publickey probe. The library turns
+                        // Failure + IsPublicKeyAcceptableAsync() == true into a
+                        // PK_OK reply, prompting the client to send the signed
+                        // request. AuthResult.Continue has NO case in the
+                        // library's dispatch switch — it falls through to the
+                        // default branch, which sends USERAUTH_FAILURE, so the
+                        // client never offers the signature and key-first
+                        // clients (FileZilla, ssh -i) can never authenticate.
+                        return ValueTask.FromResult<(AuthResult, AuthenticatedUser?)>((AuthResult.Failure, null));
+                    }
 
                     if (context.PublicKeyBlob is not { Length: > 0 } keyBlob)
                         return ValueTask.FromResult<(AuthResult, AuthenticatedUser?)>((AuthResult.Failure, null));
+
+                    if (!_owner._attemptLimiter.AllowPublicKey(
+                            sessionKey, _owner._config.Sftp.Limits.AuthenticationPubkeyAttempts))
+                    {
+                        _owner._logger?.Warning(LoggerTypes.Application,
+                            $"SFTP ed25519 auth: user={context.Username} exceeded the publickey attempt limit; rejecting.");
+                        return ValueTask.FromResult<(AuthResult, AuthenticatedUser?)>((AuthResult.Failure, null));
+                    }
 
                     authMethod = "public_key";
                     publicKey = Convert.ToBase64String(keyBlob);
@@ -605,6 +832,15 @@ public sealed class SftpHostedService : IHostedService, IDisposable
                     if (_owner._config.Sftp.DisablePasswordAuth)
                         return ValueTask.FromResult<(AuthResult, AuthenticatedUser?)>((AuthResult.Failure, null));
 
+                    if (!_owner._attemptLimiter.AllowPassword(
+                            sessionKey, _owner._config.Sftp.Limits.AuthenticationPasswordAttempts))
+                    {
+                        _owner._logger?.Warning(LoggerTypes.Application,
+                            $"SFTP ed25519 auth: user={context.Username} exceeded the password attempt limit; rejecting.");
+                        return ValueTask.FromResult<(AuthResult, AuthenticatedUser?)>((AuthResult.Failure, null));
+                    }
+
+                    isPassword = true;
                     authMethod = "password";
                     password = context.Password ?? "";
                 }
@@ -615,7 +851,13 @@ public sealed class SftpHostedService : IHostedService, IDisposable
 
                 var result = _owner.Authenticate(authMethod, context.Username, password, publicKey);
                 if (result is null)
+                {
+                    if (isPassword)
+                        _owner._attemptLimiter.RecordPasswordFailure(sessionKey);
+                    else
+                        _owner._attemptLimiter.RecordPublicKeyFailure(sessionKey);
                     return ValueTask.FromResult<(AuthResult, AuthenticatedUser?)>((AuthResult.Failure, null));
+                }
 
                 _owner._authBySession["user:" + context.Username] = result;
                 var user = new AuthenticatedUser
@@ -626,6 +868,45 @@ public sealed class SftpHostedService : IHostedService, IDisposable
                 };
                 _owner._logger?.Info(LoggerTypes.Application,
                     $"SFTP auth ok user={context.Username} webspace={result.Server}");
+
+                // Registration handshake with the connection handler: this authenticator
+                // runs on the library's own dispatch thread, and the handler (on its
+                // dedicated thread) completes the per-session signal once it is committed
+                // to busy-spinning for the connection layer. Waiting here — BEFORE
+                // returning Success — guarantees the handler's spin is already running
+                // when the library constructs the connection layer and dispatches the
+                // client's pipelined channel-open + "subsystem" request right after this
+                // method returns. Without the handshake the handler's observation and
+                // thread-scheduling latency can exceed the dispatch window and the hook
+                // attaches too late ("subsystem request failed on channel 0").
+                //
+                // Bounded, best-effort: if the handler never registers in time (e.g. its
+                // thread is starved), we proceed anyway after the budget — the auth reply
+                // is never held hostage.
+                if (sessionKey.Length > 0)
+                {
+                    var spinning = _owner._spinningSignals.GetOrAdd(sessionKey,
+                        static _ => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+                    var registered = false;
+                    try
+                    {
+                        registered = spinning.Task.Wait(SftpHostedService.SpinningHandshakeBudget);
+                    }
+                    catch
+                    {
+                        // ignore — timeout or shutdown, best effort only
+                    }
+                    finally
+                    {
+                        _owner._spinningSignals.TryRemove(sessionKey, out _);
+                    }
+
+                    _owner._logger?.Debug(LoggerTypes.Application,
+                        registered
+                            ? $"SFTP ed25519 auth: handler was spinning before success was returned t={DateTime.UtcNow:HH:mm:ss.fff}"
+                            : "SFTP ed25519 auth: handler registration TIMED OUT — proceeding best-effort (hook may land late)");
+                }
+
                 return ValueTask.FromResult<(AuthResult, AuthenticatedUser?)>((AuthResult.Success, user));
             }
             catch (Exception ex)

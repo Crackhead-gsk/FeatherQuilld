@@ -294,7 +294,14 @@ public sealed class WebSpaceRuntime : IDisposable
             {
                 await client.Containers.StopContainerAsync(name, new ContainerStopParameters
                 {
-                    WaitBeforeKillSeconds = 30,
+                    // 10s grace (Docker's own default). 30s was chosen for
+                    // well-behaved runtimes, but WebSpace containers usually
+                    // run their app as PID 1 with no SIGTERM handler, so
+                    // Docker always waits the FULL grace period before
+                    // SIGKILL — a stop then takes 30s+ (with an nginx build
+                    // ~34s), which exceeds the panel's own request timeout
+                    // (30s) and surfaces as "curl error 28" in the UI.
+                    WaitBeforeKillSeconds = 10,
                 }, cancellationToken);
             }
         }
