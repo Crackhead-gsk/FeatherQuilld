@@ -125,6 +125,9 @@ public sealed class WebSpaceInstaller
             throw new InvalidOperationException($"Installer container exited with code {wait.StatusCode}.");
 
         _logger?.Info(LoggerTypes.WebSpaces, $"Installer finished ok for {space.Uuid}");
+
+        // The install script wrote the application as root; Apache/PHP needs to own it.
+        WebSpaceFsOwnership.EnsureWebServerOwnership(space, dataPath, _logger);
     }
 
     public static string InstallLogPath(string dataPath) =>
