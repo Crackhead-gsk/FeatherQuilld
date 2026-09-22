@@ -1,1 +1,0 @@
-sudo ssh root@212.87.213.118 -o IdentityFile=/root/RiderProjects/FeatherQuilld/id_rsa 
