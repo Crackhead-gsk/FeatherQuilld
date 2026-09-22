@@ -396,8 +396,10 @@ public sealed class WebSpacesController : ControllerBase
                 if (!string.IsNullOrWhiteSpace(installLog) && installLog != "(no install log captured)\n")
                     await SendWsEventAsync(socket, "install output", [installLog], cancellationToken);
             }
-            else if (WebSpaceRuntime.NeedsContainer(space.Runtime))
+            else
             {
+                // Container WebSpaces stream their process output; static WebSpaces have no
+                // process, so the same view carries the web server log for their domains.
                 await SendRuntimeLogHistoryAsync(socket, uuid, cancellationToken);
             }
         }
