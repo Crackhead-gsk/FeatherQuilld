@@ -1,3 +1,4 @@
+using System.Linq;
 using FeatherQuilld.Utils.Config.System;
 using FeatherQuilld.Utils.Proxy;
 using FeatherQuilld.Utils.WebSpaces;
@@ -734,6 +735,169 @@ public class ReverseProxyManagerTests
             Assert.NotNull(httpsBlock);
             Assert.Contains("return 301 https://example.com$request_uri;", httpsBlock);
             Assert.Equal("example.com", ReverseProxyManager.ResolveApexDomain(space));
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { /* ignore */ }
+        }
+    }
+
+    [Fact]
+    public void EnsureSystemNginxIncludes_WritesIncludeFile_WhenConfDDirExists()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "fq-proxy-" + Guid.NewGuid().ToString("N"));
+        var confD = Path.Combine(root, "conf.d");
+        var generated = Path.Combine(root, "proxy", "nginx.conf");
+        Directory.CreateDirectory(confD);
+        Directory.CreateDirectory(Path.GetDirectoryName(generated)!);
+        File.WriteAllText(generated, "# generated\n");
+        try
+        {
+            var config = new AppConfig
+            {
+                System = new SystemConfig
+                {
+                    RootDirectory = root,
+                    Data = Path.Combine(root, "data"),
+                    DiskLimiterMode = "none",
+                    Proxy = new ProxyConfig { Enabled = true, Provider = "nginx" },
+                },
+            };
+            var mgr = new ReverseProxyManager(config);
+            var includePath = Path.Combine(confD, "featherquilld.conf");
+
+            mgr.EnsureSystemNginxIncludes(generated, confD, includePath);
+
+            if (OperatingSystem.IsWindows())
+            {
+                // The method is a deliberate no-op on Windows (nginx conf.d
+                // wiring only makes sense on the Linux hosts FeatherQuilld
+                // actually manages).
+                Assert.False(File.Exists(includePath));
+                return;
+            }
+
+            Assert.True(File.Exists(includePath));
+            var written = File.ReadAllText(includePath);
+            Assert.Contains("Managed by FeatherQuilld", written);
+            Assert.Contains($"include \"{generated}\";", written);
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { /* ignore */ }
+        }
+    }
+
+    [Fact]
+    public void EnsureSystemNginxIncludes_EscapesPath_WhenRootContainsSpacesAndQuotes()
+    {
+        if (OperatingSystem.IsWindows())
+            return; // no-op path on Windows, nothing to assert.
+
+        var root = Path.Combine(Path.GetTempPath(), "fq-proxy-" + Guid.NewGuid().ToString("N") + " with spaces");
+        var confD = Path.Combine(root, "conf.d");
+        // A path containing a double quote to prove the include directive stays
+        // well-formed even for pathological (but valid on Linux) directory names.
+        var generated = Path.Combine(root, "pro\"xy", "nginx.conf");
+        Directory.CreateDirectory(confD);
+        Directory.CreateDirectory(Path.GetDirectoryName(generated)!);
+        File.WriteAllText(generated, "# generated\n");
+        try
+        {
+            var config = new AppConfig
+            {
+                System = new SystemConfig
+                {
+                    RootDirectory = root,
+                    Data = Path.Combine(root, "data"),
+                    DiskLimiterMode = "none",
+                    Proxy = new ProxyConfig { Enabled = true, Provider = "nginx" },
+                },
+            };
+            var mgr = new ReverseProxyManager(config);
+            var includePath = Path.Combine(confD, "featherquilld.conf");
+
+            mgr.EnsureSystemNginxIncludes(generated, confD, includePath);
+
+            Assert.True(File.Exists(includePath));
+            var written = File.ReadAllText(includePath);
+            var expectedEscaped = generated.Replace("\"", "\\\"", StringComparison.Ordinal);
+            Assert.Contains($"include \"{expectedEscaped}\";", written);
+
+            // The include line must be syntactically well-formed: exactly one
+            // opening and one (escaped-aware) closing quote around the path,
+            // proving embedded quotes can't break out of the directive.
+            var includeLine = written.Split('\n').Single(l => l.StartsWith("include ", StringComparison.Ordinal));
+            Assert.StartsWith("include \"", includeLine);
+            Assert.EndsWith("\";", includeLine.TrimEnd('\r'));
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { /* ignore */ }
+        }
+    }
+
+    [Fact]
+    public void EnsureSystemNginxIncludes_SkipsWrite_WhenConfDDirMissing()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "fq-proxy-" + Guid.NewGuid().ToString("N"));
+        var confD = Path.Combine(root, "no-such-conf.d");
+        var generated = Path.Combine(root, "proxy", "nginx.conf");
+        Directory.CreateDirectory(Path.GetDirectoryName(generated)!);
+        File.WriteAllText(generated, "# generated\n");
+        try
+        {
+            var config = new AppConfig
+            {
+                System = new SystemConfig
+                {
+                    RootDirectory = root,
+                    Data = Path.Combine(root, "data"),
+                    DiskLimiterMode = "none",
+                    Proxy = new ProxyConfig { Enabled = true, Provider = "nginx" },
+                },
+            };
+            var mgr = new ReverseProxyManager(config);
+            var includePath = Path.Combine(confD, "featherquilld.conf");
+
+            mgr.EnsureSystemNginxIncludes(generated, confD, includePath);
+
+            Assert.False(File.Exists(includePath));
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { /* ignore */ }
+        }
+    }
+
+    [Fact]
+    public void EnsureSystemNginxIncludes_NeverOverwritesUnmanagedIncludeFile()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "fq-proxy-" + Guid.NewGuid().ToString("N"));
+        var confD = Path.Combine(root, "conf.d");
+        var generated = Path.Combine(root, "proxy", "nginx.conf");
+        Directory.CreateDirectory(confD);
+        Directory.CreateDirectory(Path.GetDirectoryName(generated)!);
+        File.WriteAllText(generated, "# generated\n");
+        var includePath = Path.Combine(confD, "featherquilld.conf");
+        File.WriteAllText(includePath, "# hand-written by operator\ninclude /custom/path.conf;\n");
+        try
+        {
+            var config = new AppConfig
+            {
+                System = new SystemConfig
+                {
+                    RootDirectory = root,
+                    Data = Path.Combine(root, "data"),
+                    DiskLimiterMode = "none",
+                    Proxy = new ProxyConfig { Enabled = true, Provider = "nginx" },
+                },
+            };
+            var mgr = new ReverseProxyManager(config);
+
+            mgr.EnsureSystemNginxIncludes(generated, confD, includePath);
+
+            Assert.Equal("# hand-written by operator\ninclude /custom/path.conf;\n", File.ReadAllText(includePath));
         }
         finally
         {
