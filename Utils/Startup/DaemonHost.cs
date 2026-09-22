@@ -266,6 +266,10 @@ public sealed class DaemonHost
                 sp.GetService<AppLogger>()));
         builder.Services.AddHostedService<Utils.WebSpaces.WebSpaceScheduleHostedService>();
         builder.Services.AddHostedService(sp =>
+            new Utils.WebSpaces.WebSpaceMountHealthHostedService(
+                sp.GetRequiredService<WebSpaceStore>(),
+                sp.GetService<AppLogger>()));
+        builder.Services.AddHostedService(sp =>
             new Utils.Proxy.ProxyLogRetentionHostedService(
                 sp.GetRequiredService<AppConfig>(),
                 sp.GetRequiredService<WebSpaceStore>(),

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using FeatherQuilld.Plugins.Events;
@@ -38,6 +39,9 @@ public sealed class WebSpaceStore : IWebSpaceFsAccess
     private readonly WebSpaceWsHub? _wsHub;
     private WebSpaceScheduleManager? _schedules;
     private readonly ConcurrentDictionary<Guid, WebSpace> _spaces = new();
+
+    /// <summary>WebSpaces whose quota mount had to be re-attached during startup.</summary>
+    private readonly HashSet<Guid> _mountRepairedOnBoot = new();
     private readonly ConcurrentDictionary<Guid, byte> _installInFlight = new();
     private readonly ConcurrentDictionary<Guid, CancellationTokenSource> _installTokens = new();
     private readonly object _mutateGate = new();
@@ -1516,6 +1520,18 @@ public sealed class WebSpaceStore : IWebSpaceFsAccess
             try
             {
                 EnsureBackendPort(space);
+
+                // A container that was already running before the daemon restarted keeps a
+                // bind mount pointing at the mountpoint that had to be re-attached, so its
+                // filesystem view is dead. Recreate the runtime instead of reusing it.
+                if (_mountRepairedOnBoot.Contains(space.Uuid))
+                {
+                    _logger?.Warning(LoggerTypes.WebSpaces,
+                        $"Recreating runtime for {space.Uuid} because its quota mount was re-attached");
+                    RecreateRuntime(space.Uuid);
+                    continue;
+                }
+
                 _runtime.StartAsync(space, EffectiveFsPath(space.Uuid), space.Startup).GetAwaiter().GetResult();
                 Persist(space);
             }
@@ -1712,7 +1728,8 @@ public sealed class WebSpaceStore : IWebSpaceFsAccess
                     ownerUid: WebSpaceFsOwnership.MountOwnerUid(space.Runtime),
                     ownerGid: WebSpaceFsOwnership.MountOwnerGid(space.Runtime));
                 limiter.Setup();
-                limiter.StartupAsync().GetAwaiter().GetResult();
+                if (limiter.StartupAsync().GetAwaiter().GetResult())
+                    _mountRepairedOnBoot.Add(space.Uuid);
             }
             catch (Exception ex)
             {
@@ -1741,6 +1758,57 @@ public sealed class WebSpaceStore : IWebSpaceFsAccess
 
             TryDestroyFuseMount(uuid, DataPath(uuid), diskLimitBytes: 0);
         }
+    }
+
+    /// <summary>
+    /// Re-attaches dead fusequota mounts. A mount that outlived its daemon stays in the
+    /// mount table but fails every access with ENOTCONN, so the site answers 404/502 even
+    /// though its files are present. Container WebSpaces keep a bind mount that points at
+    /// the dead mountpoint, so their runtime is recreated after a repair.
+    /// </summary>
+    /// <returns>Number of mounts that had to be repaired.</returns>
+    public int RepairUnhealthyMounts()
+    {
+        if (_config.System.EffectiveDiskLimiterMode != DiskLimiterModeKind.FuseQuota)
+            return 0;
+
+        if (!FuseQuotaLimiter.IsBinaryAvailable(_config.System))
+            return 0;
+
+        var repaired = 0;
+        foreach (var space in _spaces.Values.ToList())
+        {
+            try
+            {
+                var source = DataPath(space.Uuid);
+                if (!Directory.Exists(source))
+                    continue;
+
+                var limiter = new FuseQuotaLimiter(
+                    _config, space.Uuid, source, space.DiskLimitBytes, _logger,
+                    ownerUid: WebSpaceFsOwnership.MountOwnerUid(space.Runtime),
+                    ownerGid: WebSpaceFsOwnership.MountOwnerGid(space.Runtime));
+
+                if (!limiter.EnsureHealthyAsync().GetAwaiter().GetResult())
+                    continue;
+
+                repaired++;
+                _logger?.Warning(LoggerTypes.Disk, $"Repaired stale fusequota mount for {space.Uuid}");
+
+                if (WebSpaceRuntime.NeedsContainer(space.Runtime) && space.State == WebSpaceState.Running)
+                {
+                    _logger?.Warning(LoggerTypes.WebSpaces,
+                        $"Recreating runtime for {space.Uuid} so its container picks up the remounted data");
+                    RecreateRuntime(space.Uuid);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.Warning(LoggerTypes.Disk, $"Mount health check failed for {space.Uuid}: {ex.Message}");
+            }
+        }
+
+        return repaired;
     }
 
     private void TryDestroyFuseMount(Guid uuid, string dataPath, long diskLimitBytes)

@@ -116,10 +116,21 @@ public sealed class FuseQuotaLimiter
         _logger?.Debug(LoggerTypes.Disk, $"fusequota setup uuid={_webSpaceUuid} source={_sourcePath} mount={_mountPath}");
         Directory.CreateDirectory(_sourcePath);
         Directory.CreateDirectory(Path.GetDirectoryName(_mountPath)!);
-        Directory.CreateDirectory(_mountPath);
+
+        // A stale FUSE mount makes this throw ("The file ... already exists", ENOTCONN), and
+        // that used to abort the whole attach before StartupAsync could repair the mount.
+        try
+        {
+            Directory.CreateDirectory(_mountPath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger?.Debug(LoggerTypes.Disk,
+                $"mount path {_mountPath} could not be created ({ex.Message}); Startup will repair it");
+        }
     }
 
-    public async Task StartupAsync(CancellationToken cancellationToken = default)
+    public async Task<bool> StartupAsync(CancellationToken cancellationToken = default)
     {
         var bin = await FuseQuotaBinaryProvisioner.EnsureAsync(_config.System, _logger, cancellationToken)
             .ConfigureAwait(false);
@@ -129,15 +140,141 @@ public sealed class FuseQuotaLimiter
 
         _logger?.Debug(LoggerTypes.Disk, $"fusequota startup uuid={_webSpaceUuid} bin={bin} limit={_diskLimitBytes}");
 
-        if (await IsSocketFunctionalAsync(cancellationToken).ConfigureAwait(false))
+        if (!await EnsureHealthyAsync(cancellationToken).ConfigureAwait(false))
         {
             _logger?.Debug(LoggerTypes.Disk, $"fusequota already running for {_webSpaceUuid} (socket ok)");
-            return;
+            return false;
+        }
+
+        _logger?.Info(LoggerTypes.Disk, $"fusequota ready for {_webSpaceUuid}");
+        return true;
+    }
+
+    /// <summary>
+    /// Makes sure this WebSpace has a live quota mount and repairs it when it does not.
+    /// A mount can survive as a dead entry (every access fails with ENOTCONN, e.g. after the
+    /// daemon was restarted or killed) which makes the site answer 404/502 even though the
+    /// files are present - and a plain "already running? spawn" check never noticed it,
+    /// because mounting on top of the stale entry fails with "already exists".
+    /// </summary>
+    /// <returns>true when the mount had to be (re)created, false when it was healthy.</returns>
+    public async Task<bool> EnsureHealthyAsync(CancellationToken cancellationToken = default)
+    {
+        var mounted = IsMounted(_mountPath);
+        var accessible = IsMountAccessible(_mountPath);
+        var socketOk = await IsSocketFunctionalAsync(cancellationToken).ConfigureAwait(false);
+
+        if (mounted && accessible && socketOk)
+            return false;
+
+        if (mounted)
+        {
+            _logger?.Warning(LoggerTypes.Disk,
+                $"fusequota mount {_mountPath} for {_webSpaceUuid} is stale (accessible={accessible}, socket={socketOk}); remounting");
+            await UnmountStaleAsync(cancellationToken).ConfigureAwait(false);
+        }
+        else if (File.Exists(_socketPath))
+        {
+            // Leftover socket from a previous run; a fresh daemon cannot bind it.
+            try { File.Delete(_socketPath); } catch { /* best-effort */ }
         }
 
         await SpawnDaemonAsync(cancellationToken).ConfigureAwait(false);
         await WaitForSocketAsync(TimeSpan.FromSeconds(10), cancellationToken).ConfigureAwait(false);
-        _logger?.Info(LoggerTypes.Disk, $"fusequota ready for {_webSpaceUuid}");
+        return true;
+    }
+
+    /// <summary>True when the path is currently a mount point (from /proc/self/mounts).</summary>
+    public static bool IsMounted(string mountPath)
+    {
+        try
+        {
+            var target = Path.TrimEndingDirectorySeparator(Path.GetFullPath(mountPath));
+            foreach (var line in File.ReadLines("/proc/self/mounts"))
+            {
+                var parts = line.Split(' ', 3);
+                if (parts.Length >= 2
+                    && string.Equals(WebSpaceFsOwnership.UnescapeMountField(parts[1]), target, StringComparison.Ordinal))
+                    return true;
+            }
+        }
+        catch
+        {
+            // treat as not mounted
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// False when the path cannot be stat()ed. Dead FUSE mounts surface here as an
+    /// IOException (ENOTCONN / "Transport endpoint is not connected").
+    /// </summary>
+    public static bool IsMountAccessible(string mountPath)
+    {
+        try
+        {
+            _ = new DirectoryInfo(mountPath).Attributes;
+            return true;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Dead FUSE mounts surface as ENOTCONN ("Transport endpoint is not connected")
+            // or, via Directory.CreateDirectory, as "The file ... already exists".
+            return false;
+        }
+    }
+
+    private async Task UnmountStaleAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "umount",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            psi.ArgumentList.Add("-l");
+            psi.ArgumentList.Add(_mountPath);
+
+            using var process = Process.Start(psi);
+            if (process is null)
+            {
+                _logger?.Warning(LoggerTypes.Disk, $"could not start umount for {_mountPath}");
+            }
+            else
+            {
+                await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+                if (process.ExitCode != 0)
+                {
+                    _logger?.Warning(LoggerTypes.Disk,
+                        $"umount -l {_mountPath} exited with {process.ExitCode}: {process.StandardError.ReadToEnd().Trim()}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger?.Warning(LoggerTypes.Disk, $"umount -l {_mountPath} failed: {ex.Message}");
+        }
+
+        try
+        {
+            if (File.Exists(_socketPath))
+                File.Delete(_socketPath);
+        }
+        catch
+        {
+            // best-effort
+        }
+
+        // Give the kernel a moment to release the mount point before mounting again.
+        await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken).ConfigureAwait(false);
     }
 
     public async Task ShutdownAsync(CancellationToken cancellationToken = default)
