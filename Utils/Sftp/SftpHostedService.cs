@@ -35,7 +35,10 @@ public sealed class SftpHostedService : IHostedService, IDisposable
     private readonly AppLogger? _logger;
     private readonly IEventBus _events;
     private readonly ConcurrentDictionary<string, SftpAuthResult> _authBySession = new();
-    private readonly ConcurrentDictionary<uint, byte> _sftpChannels = new();
+    // Per-connection: SSH LocalChannelId restarts at 0 on every session, so a
+    // process-wide map keyed only by channel id would leak and cross-contaminate
+    // concurrent clients. Entries are dropped when the connection handler ends.
+    private readonly ConcurrentDictionary<SshConnection, ConcurrentDictionary<uint, byte>> _sftpChannelsByConnection = new();
 
     // Registration handshake between the connection handler and the panel
     // authenticator (which runs on the library's own dispatch thread): the
@@ -290,6 +293,7 @@ public sealed class SftpHostedService : IHostedService, IDisposable
         }
         finally
         {
+            _sftpChannelsByConnection.TryRemove(connection, out _);
             try
             {
                 var sessionKey = Convert.ToHexString(connection.SessionId.ToArray());
@@ -454,7 +458,7 @@ public sealed class SftpHostedService : IHostedService, IDisposable
                 return (true, false);
             }
 
-            var hooked = HookSubsystemRequests(layer);
+            var hooked = HookSubsystemRequests(layer, connection);
             _logger?.Debug(LoggerTypes.Application,
                 $"SFTP ed25519 handler: hook attach {(hooked ? "succeeded" : "FAILED")} after spin t={DateTime.UtcNow:HH:mm:ss.fff}");
             return (true, hooked);
@@ -466,10 +470,13 @@ public sealed class SftpHostedService : IHostedService, IDisposable
         }
     }
 
-    private bool HookSubsystemRequests(ConnectionLayer layer)
+    private bool HookSubsystemRequests(ConnectionLayer layer, SshConnection connection)
     {
         try
         {
+            var sftpChannels = _sftpChannelsByConnection.GetOrAdd(
+                connection, static _ => new ConcurrentDictionary<uint, byte>());
+
             layer.ChannelRequestReceived += (channel, request, _) =>
             {
                 _logger?.Debug(LoggerTypes.Application,
@@ -482,7 +489,7 @@ public sealed class SftpHostedService : IHostedService, IDisposable
                 if (!string.Equals(name, "sftp", StringComparison.OrdinalIgnoreCase))
                     return ValueTask.FromResult(false);
 
-                _sftpChannels[channel.LocalChannelId] = 1;
+                sftpChannels[channel.LocalChannelId] = 1;
                 if (channel.Environment is not null)
                     channel.Environment["featherquilld.subsystem"] = "sftp";
                 return ValueTask.FromResult(true);
@@ -505,12 +512,12 @@ public sealed class SftpHostedService : IHostedService, IDisposable
         {
             for (var i = 0; i < 50 && !ct.IsCancellationRequested; i++)
             {
-                if (IsSftpChannel(channel))
+                if (IsSftpChannel(connection, channel))
                     break;
                 await Task.Delay(20, ct).ConfigureAwait(false);
             }
 
-            if (!IsSftpChannel(channel))
+            if (!IsSftpChannel(connection, channel))
             {
                 await channel.CloseAsync(ct).ConfigureAwait(false);
                 return;
@@ -558,6 +565,11 @@ public sealed class SftpHostedService : IHostedService, IDisposable
             _logger?.Warning(LoggerTypes.Application, $"SFTP ed25519 channel failed: {ex}");
             try { await channel.CloseAsync(CancellationToken.None).ConfigureAwait(false); } catch { /* ignore */ }
         }
+        finally
+        {
+            if (_sftpChannelsByConnection.TryGetValue(connection, out var channels))
+                channels.TryRemove(channel.LocalChannelId, out _);
+        }
     }
 
     private bool TryGetEmbeddedAuth(SshConnection connection, out SftpAuthResult auth)
@@ -590,9 +602,10 @@ public sealed class SftpHostedService : IHostedService, IDisposable
         return false;
     }
 
-    private bool IsSftpChannel(SshChannel channel)
+    private bool IsSftpChannel(SshConnection connection, SshChannel channel)
     {
-        if (_sftpChannels.ContainsKey(channel.LocalChannelId))
+        if (_sftpChannelsByConnection.TryGetValue(connection, out var channels)
+            && channels.ContainsKey(channel.LocalChannelId))
             return true;
 
         if (channel.Environment is not null
