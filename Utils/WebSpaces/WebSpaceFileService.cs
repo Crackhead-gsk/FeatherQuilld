@@ -184,7 +184,10 @@ public sealed class WebSpaceFileService
         var path = ResolveWritable(root, file);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         RemoveEscapingSymlinkIfPresent(root, path);
-        File.WriteAllText(path, contents ?? "", Encoding.UTF8);
+        // Encoding.UTF8 would put a BOM in front of every saved file. That breaks .htaccess (Apache: Invalid command
+        // '\xef\xbb\xbf#'), scripts with a shebang and output before the headers of a <?php file, and the editor
+        // never shows it because ReadText strips it again.
+        File.WriteAllText(path, contents ?? "", new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
     
     }
 
