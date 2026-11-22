@@ -60,6 +60,30 @@ public class WebSpaceFileServiceTests : IDisposable
     }
 
     [Fact]
+    public void WriteText_WritesPlainUtf8WithoutByteOrderMark()
+    {
+        // A BOM in front of .htaccess makes Apache fail with "Invalid command '\xef\xbb\xbf#'", and in front of
+        // <?php it is sent to the browser before any header. The editor never shows it, so users cannot spot it.
+        const string text = "# rules\nGr\u00fc\u00dfe \u2713\n";
+        _files.WriteText(_uuid, "/public/.htaccess", text);
+
+        var bytes = File.ReadAllBytes(Path.Combine(_root, "public", ".htaccess"));
+        Assert.Equal(System.Text.Encoding.UTF8.GetBytes(text), bytes);
+        Assert.Equal(text, _files.ReadText(_uuid, "/public/.htaccess"));
+    }
+
+    [Fact]
+    public void WriteText_RemovesAByteOrderMarkThatWasAlreadyInTheFile()
+    {
+        var path = Path.Combine(_root, "public", "old.php");
+        File.WriteAllBytes(path, [0xEF, 0xBB, 0xBF, (byte)'<', (byte)'?']);
+
+        _files.WriteText(_uuid, "/public/old.php", _files.ReadText(_uuid, "/public/old.php"));
+
+        Assert.Equal(new[] { (byte)'<', (byte)'?' }, File.ReadAllBytes(path));
+    }
+
+    [Fact]
     public void CreateDirectory_AndDelete()
     {
         _files.CreateDirectory(_uuid, "/public/subdir");
